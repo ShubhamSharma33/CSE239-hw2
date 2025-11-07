@@ -5,6 +5,8 @@ services:
     build: .
     container_name: worker-1
     hostname: worker-1
+    environment:
+      - PYTHONUNBUFFERED=1
     networks:
       - mapreduce-net
     command: python worker.py
@@ -13,6 +15,8 @@ services:
     build: .
     container_name: worker-2
     hostname: worker-2
+    environment:
+      - PYTHONUNBUFFERED=1
     networks:
       - mapreduce-net
     command: python worker.py
@@ -21,6 +25,8 @@ services:
     build: .
     container_name: worker-3
     hostname: worker-3
+    environment:
+      - PYTHONUNBUFFERED=1
     networks:
       - mapreduce-net
     command: python worker.py
@@ -29,41 +35,51 @@ services:
     build: .
     container_name: worker-4
     hostname: worker-4
+    environment:
+      - PYTHONUNBUFFERED=1
     networks:
       - mapreduce-net
     command: python worker.py
 
-  # worker-5:
-  #   build: .
-  #   container_name: worker-5
-  #   hostname: worker-5
-  #   networks:
-  #     - mapreduce-net
-  #   command: python worker.py
+  worker-5:
+    build: .
+    container_name: worker-5
+    hostname: worker-5
+    environment:
+      - PYTHONUNBUFFERED=1
+    networks:
+      - mapreduce-net
+    command: python worker.py
 
-  # worker-6:
-  #   build: .
-  #   container_name: worker-6
-  #   hostname: worker-6
-  #   networks:
-  #     - mapreduce-net
-  #   command: python worker.py
+  worker-6:
+    build: .
+    container_name: worker-6
+    hostname: worker-6
+    environment:
+      - PYTHONUNBUFFERED=1
+    networks:
+      - mapreduce-net
+    command: python worker.py
 
-  # worker-7:
-  #   build: .
-  #   container_name: worker-7
-  #   hostname: worker-7
-  #   networks:
-  #     - mapreduce-net
-  #   command: python worker.py
+  worker-7:
+    build: .
+    container_name: worker-7
+    hostname: worker-7
+    environment:
+      - PYTHONUNBUFFERED=1
+    networks:
+      - mapreduce-net
+    command: python worker.py
 
-  # worker-8:
-  #   build: .
-  #   container_name: worker-8
-  #   hostname: worker-8
-  #   networks:
-  #     - mapreduce-net
-  #   command: python worker.py
+  worker-8:
+    build: .
+    container_name: worker-8
+    hostname: worker-8
+    environment:
+      - PYTHONUNBUFFERED=1
+    networks:
+      - mapreduce-net
+    command: python worker.py
 
   coordinator:
     build: .
@@ -80,10 +96,10 @@ services:
       - worker-2
       - worker-3
       - worker-4
-      # - worker-5
-      # - worker-6
-      # - worker-7
-      # - worker-8
+      - worker-5
+      - worker-6
+      - worker-7
+      - worker-8
     networks:
       - mapreduce-net
 

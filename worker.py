@@ -4,17 +4,21 @@ import re
 
 class MapReduceService(rpyc.Service):
     def exposed_map(self, text_chunk):
-        """Map: tokenize text and return word counts"""
+        """
+        Map function: Tokenize text and return word frequency dict
+        Returns dict instead of list of tuples for efficient aggregation
+        """
+        # Extract words (lowercase, alphabetic only)
         words = re.findall(r'\b[a-z]+\b', text_chunk.lower())
-        return [(word, 1) for word in words]
-    
-    def exposed_reduce(self, word_count_pairs):
-        """Reduce: sum up counts for words"""
-        total = sum(count for word, count in word_count_pairs)
-        return total
+        
+        # Count words in this chunk
+        word_counts = Counter(words)
+        
+        # Return as regular dict (not Counter, to avoid serialization issues)
+        return dict(word_counts)
 
 if __name__ == "__main__":
     from rpyc.utils.server import ThreadedServer
     print("Worker starting on port 18861...")
-    t = ThreadedServer(MapReduceService, port=18861)
-    t.start()
+    server = ThreadedServer(MapReduceService, port=18861)
+    server.start()

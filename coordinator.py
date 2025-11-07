@@ -6,14 +6,21 @@ import os
 import glob
 from collections import defaultdict
 from operator import itemgetter
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
+# Configuration
 WORKERS = [
     ("worker-1", 18861),
     ("worker-2", 18861),
     ("worker-3", 18861),
     ("worker-4", 18861),
+    ("worker-5", 18861),
+    ("worker-6", 18861),
+    ("worker-7", 18861),
+    ("worker-8", 18861),
 ]
+
+# Streaming configuration - don't load entire file!
+STREAM_CHUNK_SIZE = 1024 * 1024 * 50  # 50MB chunks
 
 def download(url='https://mattmahoney.net/dc/enwik8.zip'):
     """Download and extract dataset"""
@@ -33,179 +40,190 @@ def download(url='https://mattmahoney.net/dc/enwik8.zip'):
     
     return glob.glob('txt/*')
 
-def get_file_chunks(files, n_workers):
-    """Yield file chunks without loading entire file"""
-    # Calculate total size
-    total_size = sum(os.path.getsize(f) for f in files)
-    chunk_size = total_size // n_workers
-    
-    # Read and yield chunks
-    current_chunk = []
-    current_size = 0
-    chunks_yielded = 0
-    
-    for file_path in files:
-        with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
-            BLOCK_SIZE = 1024 * 1024  # 1MB blocks
+def stream_file_in_chunks(filepath, chunk_size=STREAM_CHUNK_SIZE):
+    """
+    Generator that yields text chunks without loading entire file.
+    This is KEY to handling large files efficiently!
+    """
+    with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
+        buffer = []
+        buffer_size = 0
+        
+        for line in f:
+            buffer.append(line)
+            buffer_size += len(line)
             
-            while True:
-                block = f.read(BLOCK_SIZE)
-                if not block:
-                    break
-                
-                current_chunk.append(block)
-                current_size += len(block)
-                
-                # Yield chunk when it's full
-                if current_size >= chunk_size and chunks_yielded < n_workers - 1:
-                    yield ''.join(current_chunk)
-                    current_chunk = []
-                    current_size = 0
-                    chunks_yielded += 1
-    
-    # Yield remaining data
-    if current_chunk:
-        yield ''.join(current_chunk)
-
-def map_worker(worker_info, chunk):
-    """Execute map on a single worker"""
-    hostname, port = worker_info
-    try:
-        conn = rpyc.connect(hostname, port, config={"allow_public_attrs": True})
-        result = conn.root.exposed_map(chunk)
-        result = list(result)  # Convert to local list
-        conn.close()
-        return (hostname, result, None)
-    except Exception as e:
-        return (hostname, None, str(e))
-
-def reduce_worker(worker_info, word_groups):
-    """Execute reduce on a single worker"""
-    hostname, port = worker_info
-    results = {}
-    try:
-        conn = rpyc.connect(hostname, port, config={"allow_public_attrs": True})
+            # When buffer reaches chunk size, yield it
+            if buffer_size >= chunk_size:
+                yield ''.join(buffer)
+                buffer = []
+                buffer_size = 0
         
-        for word, pairs in word_groups.items():
-            total = conn.root.exposed_reduce(pairs)
-            results[word] = int(total)
-        
-        conn.close()
-        return (hostname, results, None)
-    except Exception as e:
-        return (hostname, None, str(e))
+        # Don't forget remaining data
+        if buffer:
+            yield ''.join(buffer)
 
-def mapreduce_wordcount(input_files):
-    n_workers = len(WORKERS)
+class WorkerPool:
+    """Manages persistent connections to workers with round-robin distribution"""
     
-    # 1. Get chunks as generator (doesn't load everything!)
-    print(f"Preparing to split data into {n_workers} chunks...")
-    chunks = list(get_file_chunks(input_files, n_workers))
-    print(f"  Split complete. Chunk sizes: {[f'{len(c)/1024/1024:.1f}MB' for c in chunks]}")
+    def __init__(self, worker_addresses):
+        self.workers = worker_addresses
+        self.connections = []
+        self.next_worker_idx = 0
+        
+        # Establish all connections upfront
+        print(f"Connecting to {len(worker_addresses)} workers...")
+        for hostname, port in worker_addresses:
+            try:
+                conn = rpyc.connect(
+                    hostname, 
+                    port,
+                    config={
+                        "allow_public_attrs": True,
+                        "sync_request_timeout": 90
+                    }
+                )
+                self.connections.append(conn)
+                print(f"  ✓ Connected to {hostname}:{port}")
+            except Exception as e:
+                print(f"  ✗ Failed to connect to {hostname}:{port} - {e}")
+                raise
     
-    # 2. MAP PHASE - PARALLEL
-    print("\nMAP PHASE: Sending chunks to workers IN PARALLEL...")
+    def get_next_connection(self):
+        """Round-robin worker selection"""
+        conn = self.connections[self.next_worker_idx]
+        self.next_worker_idx = (self.next_worker_idx + 1) % len(self.connections)
+        return conn
+    
+    def close_all(self):
+        """Clean up all connections"""
+        for conn in self.connections:
+            try:
+                conn.close()
+            except:
+                pass
+
+def mapreduce_wordcount(input_files, worker_pool):
+    """
+    Optimized MapReduce using:
+    1. Async RPyC calls (non-blocking)
+    2. Streaming file reading (low memory)
+    3. Persistent connections (no reconnect overhead)
+    """
+    
+    print("\n" + "="*60)
+    print("STARTING MAP PHASE WITH ASYNC CALLS")
+    print("="*60)
+    
+    # Track async operations
+    pending_tasks = []
+    all_word_counts = defaultdict(int)
+    
+    def collect_completed_results():
+        """Check which async tasks are done and aggregate their results"""
+        nonlocal pending_tasks, all_word_counts
+        
+        still_pending = []
+        for async_result in pending_tasks:
+            if async_result.ready:
+                # Get result and aggregate
+                word_dict = async_result.value
+                for word, count in word_dict.items():
+                    all_word_counts[word] += count
+            else:
+                still_pending.append(async_result)
+        
+        pending_tasks = still_pending
+    
+    # Process each file
+    total_chunks_sent = 0
     map_start = time.time()
     
-    map_results = []
-    
-    with ThreadPoolExecutor(max_workers=n_workers) as executor:
-        futures = {
-            executor.submit(map_worker, WORKERS[i], chunks[i]): i 
-            for i in range(len(chunks))
-        }
+    for filepath in input_files:
+        print(f"\nProcessing file: {filepath}")
         
-        for future in as_completed(futures):
-            hostname, result, error = future.result()
-            if error:
-                print(f"  ✗ Failed: {error}")
-            else:
-                map_results.extend(result)
-                print(f"  ✓ Worker completed ({len(result)} pairs)")
+        # Stream file in chunks
+        for chunk_text in stream_file_in_chunks(filepath):
+            # Get next available worker connection
+            worker_conn = worker_pool.get_next_connection()
+            
+            # Send async map request (non-blocking!)
+            async_result = rpyc.async_(worker_conn.root.exposed_map)(chunk_text)
+            pending_tasks.append(async_result)
+            total_chunks_sent += 1
+            
+            # Periodically collect completed results to avoid memory buildup
+            if len(pending_tasks) > 20:
+                collect_completed_results()
+                time.sleep(0.01)  # Small delay to let tasks complete
+            
+            if total_chunks_sent % 10 == 0:
+                print(f"  Dispatched {total_chunks_sent} chunks, {len(pending_tasks)} pending...")
+    
+    # Wait for all remaining tasks to complete
+    print(f"\nWaiting for {len(pending_tasks)} remaining tasks...")
+    while pending_tasks:
+        collect_completed_results()
+        if pending_tasks:
+            time.sleep(0.1)
     
     map_time = time.time() - map_start
-    print(f"  Map phase: {map_time:.2f}s")
+    print(f"\n✓ Map phase complete!")
+    print(f"  Total chunks processed: {total_chunks_sent}")
+    print(f"  Unique words found: {len(all_word_counts)}")
+    print(f"  Time taken: {map_time:.2f} seconds")
     
-    # 3. SHUFFLE PHASE
-    print("\nSHUFFLE PHASE: Grouping results...")
-    shuffle_start = time.time()
+    # No separate reduce phase needed - we aggregated during map!
+    # Sort results by frequency
+    sorted_results = sorted(all_word_counts.items(), key=itemgetter(1), reverse=True)
     
-    grouped = defaultdict(list)
-    for word, count in map_results:
-        grouped[word].append((word, count))
-    
-    shuffle_time = time.time() - shuffle_start
-    print(f"  Shuffle phase: {shuffle_time:.2f}s ({len(grouped)} unique words)")
-    
-    # 4. REDUCE PHASE - PARALLEL
-    print("\nREDUCE PHASE: Aggregating counts IN PARALLEL...")
-    reduce_start = time.time()
-    
-    words = list(grouped.keys())
-    words_per_worker = len(words) // n_workers
-    
-    worker_batches = []
-    for i in range(n_workers):
-        start_idx = i * words_per_worker
-        end_idx = start_idx + words_per_worker if i < n_workers - 1 else len(words)
-        worker_words = words[start_idx:end_idx]
-        batch = {word: grouped[word] for word in worker_words}
-        worker_batches.append(batch)
-    
-    final_counts = {}
-    
-    with ThreadPoolExecutor(max_workers=n_workers) as executor:
-        futures = {
-            executor.submit(reduce_worker, WORKERS[i], worker_batches[i]): i 
-            for i in range(n_workers)
-        }
-        
-        for future in as_completed(futures):
-            hostname, results, error = future.result()
-            if error:
-                print(f"  ✗ Failed: {error}")
-            else:
-                final_counts.update(results)
-                print(f"  ✓ Worker completed ({len(results)} words)")
-    
-    reduce_time = time.time() - reduce_start
-    print(f"  Reduce phase: {reduce_time:.2f}s")
-    
-    # Clear chunks from memory
-    chunks = None
-    
-    # 5. Sort and return
-    sorted_counts = sorted(final_counts.items(), key=itemgetter(1), reverse=True)
-    return sorted_counts
+    return sorted_results
 
 if __name__ == "__main__":
     print("="*60)
     print("MEMORY-OPTIMIZED MAPREDUCE WORD COUNT")
+    print("Using: Async RPyC + Streaming Files + Persistent Connections")
     print("="*60)
     
+    # Download dataset
     input_files = download()
     
+    # Wait for workers to be ready
     print("\nWaiting for workers to start...")
     time.sleep(5)
     
-    print("\n" + "="*60)
-    print("STARTING MAPREDUCE")
-    print("="*60)
+    # Create worker pool with persistent connections
+    worker_pool = WorkerPool(WORKERS)
     
-    start_time = time.time()
-    word_counts = mapreduce_wordcount(input_files)
-    end_time = time.time()
-    
-    print('\n' + '='*60)
-    print('TOP 20 WORDS BY FREQUENCY')
-    print('='*60)
-    top20 = word_counts[:20]
-    longest = max(len(word) for word, count in top20) if top20 else 0
-    
-    for i, (word, count) in enumerate(top20, 1):
-        print(f'{i}.\t{word:<{longest+2}} {count:>8}')
-    
-    elapsed_time = end_time - start_time
-    print('='*60)
-    print(f"✓ Total Elapsed Time: {elapsed_time:.2f} seconds")
-    print('='*60)
+    try:
+        # Run MapReduce
+        overall_start = time.time()
+        word_counts = mapreduce_wordcount(input_files, worker_pool)
+        overall_end = time.time()
+        
+        # Display results
+        print('\n' + '='*60)
+        print('TOP 20 MOST FREQUENT WORDS')
+        print('='*60)
+        
+        top20 = word_counts[:20]
+        max_word_len = max(len(word) for word, count in top20) if top20 else 10
+        
+        for rank, (word, count) in enumerate(top20, 1):
+            print(f'{rank:2d}. {word:<{max_word_len+2}} {count:>10,}')
+        
+        # Save full results
+        output_file = 'txt/results.txt'
+        with open(output_file, 'w', encoding='utf-8') as f:
+            for word, count in word_counts:
+                f.write(f'{word}\t{count}\n')
+        
+        print('\n' + '='*60)
+        print(f'✓ Complete! Saved results to {output_file}')
+        print(f'✓ Total unique words: {len(word_counts):,}')
+        print(f'✓ TOTAL ELAPSED TIME: {overall_end - overall_start:.2f} seconds')
+        print('='*60)
+        
+    finally:
+        # Always clean up connections
+        worker_pool.close_all()

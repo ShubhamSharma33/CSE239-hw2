@@ -6,7 +6,6 @@ import os
 import glob
 from collections import defaultdict
 from operator import itemgetter
-import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 WORKERS = [
@@ -34,49 +33,61 @@ def download(url='https://mattmahoney.net/dc/enwik8.zip'):
     
     return glob.glob('txt/*')
 
-def split_text(files, n_workers):
-    """Split files into n_workers chunks"""
-    all_text = ""
+def get_file_chunks(files, n_workers):
+    """Yield file chunks without loading entire file"""
+    # Calculate total size
+    total_size = sum(os.path.getsize(f) for f in files)
+    chunk_size = total_size // n_workers
+    
+    # Read and yield chunks
+    current_chunk = []
+    current_size = 0
+    chunks_yielded = 0
+    
     for file_path in files:
         with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
-            all_text += f.read()
+            BLOCK_SIZE = 1024 * 1024  # 1MB blocks
+            
+            while True:
+                block = f.read(BLOCK_SIZE)
+                if not block:
+                    break
+                
+                current_chunk.append(block)
+                current_size += len(block)
+                
+                # Yield chunk when it's full
+                if current_size >= chunk_size and chunks_yielded < n_workers - 1:
+                    yield ''.join(current_chunk)
+                    current_chunk = []
+                    current_size = 0
+                    chunks_yielded += 1
     
-    chunk_size = len(all_text) // n_workers
-    chunks = []
-    
-    for i in range(n_workers):
-        start = i * chunk_size
-        end = start + chunk_size if i < n_workers - 1 else len(all_text)
-        chunks.append(all_text[start:end])
-    
-    return chunks
+    # Yield remaining data
+    if current_chunk:
+        yield ''.join(current_chunk)
 
 def map_worker(worker_info, chunk):
-    """Execute map on a single worker - for parallel execution"""
+    """Execute map on a single worker"""
     hostname, port = worker_info
     try:
         conn = rpyc.connect(hostname, port, config={"allow_public_attrs": True})
         result = conn.root.exposed_map(chunk)
-        
-        # CRITICAL: Convert netref to actual list BEFORE closing connection!
-        result = list(result)
-        
+        result = list(result)  # Convert to local list
         conn.close()
         return (hostname, result, None)
     except Exception as e:
         return (hostname, None, str(e))
 
 def reduce_worker(worker_info, word_groups):
-    """Execute reduce on a single worker - for parallel execution"""
+    """Execute reduce on a single worker"""
     hostname, port = worker_info
     results = {}
     try:
         conn = rpyc.connect(hostname, port, config={"allow_public_attrs": True})
         
-        # Process ALL words assigned to this worker in one connection
         for word, pairs in word_groups.items():
             total = conn.root.exposed_reduce(pairs)
-            # CRITICAL: Convert to int BEFORE closing connection!
             results[word] = int(total)
         
         conn.close()
@@ -87,36 +98,36 @@ def reduce_worker(worker_info, word_groups):
 def mapreduce_wordcount(input_files):
     n_workers = len(WORKERS)
     
-    # 1. Split text into chunks
-    print(f"Splitting data into {n_workers} chunks...")
-    chunks = split_text(input_files, n_workers)
+    # 1. Get chunks as generator (doesn't load everything!)
+    print(f"Preparing to split data into {n_workers} chunks...")
+    chunks = list(get_file_chunks(input_files, n_workers))
+    print(f"  Split complete. Chunk sizes: {[f'{len(c)/1024/1024:.1f}MB' for c in chunks]}")
     
-    # 2. MAP PHASE - PARALLEL!
-    print("MAP PHASE: Sending chunks to workers IN PARALLEL...")
+    # 2. MAP PHASE - PARALLEL
+    print("\nMAP PHASE: Sending chunks to workers IN PARALLEL...")
     map_start = time.time()
     
     map_results = []
     
-    # Use ThreadPoolExecutor for parallel map operations
     with ThreadPoolExecutor(max_workers=n_workers) as executor:
         futures = {
             executor.submit(map_worker, WORKERS[i], chunks[i]): i 
-            for i in range(n_workers)
+            for i in range(len(chunks))
         }
         
         for future in as_completed(futures):
             hostname, result, error = future.result()
             if error:
-                print(f"  ✗ {hostname} failed: {error}")
+                print(f"  ✗ Failed: {error}")
             else:
                 map_results.extend(result)
-                print(f"  ✓ {hostname} completed")
+                print(f"  ✓ Worker completed ({len(result)} pairs)")
     
     map_time = time.time() - map_start
-    print(f"  Map phase took: {map_time:.2f} seconds")
+    print(f"  Map phase: {map_time:.2f}s")
     
     # 3. SHUFFLE PHASE
-    print("SHUFFLE PHASE: Grouping intermediate results...")
+    print("\nSHUFFLE PHASE: Grouping results...")
     shuffle_start = time.time()
     
     grouped = defaultdict(list)
@@ -124,30 +135,25 @@ def mapreduce_wordcount(input_files):
         grouped[word].append((word, count))
     
     shuffle_time = time.time() - shuffle_start
-    print(f"  Shuffle phase took: {shuffle_time:.2f} seconds")
+    print(f"  Shuffle phase: {shuffle_time:.2f}s ({len(grouped)} unique words)")
     
-    # 4. REDUCE PHASE - PARALLEL with BATCHING!
-    print("REDUCE PHASE: Aggregating counts IN PARALLEL...")
+    # 4. REDUCE PHASE - PARALLEL
+    print("\nREDUCE PHASE: Aggregating counts IN PARALLEL...")
     reduce_start = time.time()
     
-    # Partition words across workers
     words = list(grouped.keys())
     words_per_worker = len(words) // n_workers
     
-    # Create batches for each worker
     worker_batches = []
     for i in range(n_workers):
         start_idx = i * words_per_worker
         end_idx = start_idx + words_per_worker if i < n_workers - 1 else len(words)
         worker_words = words[start_idx:end_idx]
-        
-        # Create a dict of word -> pairs for this worker
         batch = {word: grouped[word] for word in worker_words}
         worker_batches.append(batch)
     
     final_counts = {}
     
-    # Use ThreadPoolExecutor for parallel reduce operations
     with ThreadPoolExecutor(max_workers=n_workers) as executor:
         futures = {
             executor.submit(reduce_worker, WORKERS[i], worker_batches[i]): i 
@@ -157,13 +163,16 @@ def mapreduce_wordcount(input_files):
         for future in as_completed(futures):
             hostname, results, error = future.result()
             if error:
-                print(f"  ✗ {hostname} failed: {error}")
+                print(f"  ✗ Failed: {error}")
             else:
                 final_counts.update(results)
-                print(f"  ✓ {hostname} completed")
+                print(f"  ✓ Worker completed ({len(results)} words)")
     
     reduce_time = time.time() - reduce_start
-    print(f"  Reduce phase took: {reduce_time:.2f} seconds")
+    print(f"  Reduce phase: {reduce_time:.2f}s")
+    
+    # Clear chunks from memory
+    chunks = None
     
     # 5. Sort and return
     sorted_counts = sorted(final_counts.items(), key=itemgetter(1), reverse=True)
@@ -171,17 +180,14 @@ def mapreduce_wordcount(input_files):
 
 if __name__ == "__main__":
     print("="*60)
-    print("OPTIMIZED MAPREDUCE WORD COUNT")
+    print("MEMORY-OPTIMIZED MAPREDUCE WORD COUNT")
     print("="*60)
     
-    # Download dataset
     input_files = download()
     
-    # Wait for workers
     print("\nWaiting for workers to start...")
     time.sleep(5)
     
-    # Run MapReduce
     print("\n" + "="*60)
     print("STARTING MAPREDUCE")
     print("="*60)
@@ -190,7 +196,6 @@ if __name__ == "__main__":
     word_counts = mapreduce_wordcount(input_files)
     end_time = time.time()
     
-    # Print results
     print('\n' + '='*60)
     print('TOP 20 WORDS BY FREQUENCY')
     print('='*60)

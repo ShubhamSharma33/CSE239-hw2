@@ -1,107 +1,65 @@
-version: '3.8'
+version: "3.8"
 
 services:
+  coordinator:
+    build: .
+    container_name: coordinator
+    hostname: coordinator
+    command: python coordinator.py
+    networks:
+      - mapreduce-net
+    environment:
+      - NUM_WORKERS=3
+      - PYTHONUNBUFFERED=1
+    ports:
+      - "18860:18860"
+    volumes:
+      - ./txt:/app/txt
+
   worker-1:
     build: .
     container_name: worker-1
     hostname: worker-1
-    environment:
-      - PYTHONUNBUFFERED=1
+    command: python worker.py
     networks:
       - mapreduce-net
-    command: python worker.py
+    environment:
+      - COORDINATOR_HOST=coordinator
+      - PYTHONUNBUFFERED=1
+    volumes:
+      - ./txt:/app/txt
+    depends_on:
+      - coordinator
 
   worker-2:
     build: .
     container_name: worker-2
     hostname: worker-2
-    environment:
-      - PYTHONUNBUFFERED=1
+    command: python worker.py
     networks:
       - mapreduce-net
-    command: python worker.py
+    environment:
+      - COORDINATOR_HOST=coordinator
+      - PYTHONUNBUFFERED=1
+    volumes:
+      - ./txt:/app/txt
+    depends_on:
+      - coordinator
 
   worker-3:
     build: .
     container_name: worker-3
     hostname: worker-3
-    environment:
-      - PYTHONUNBUFFERED=1
+    command: python worker.py
     networks:
       - mapreduce-net
-    command: python worker.py
-
-  worker-4:
-    build: .
-    container_name: worker-4
-    hostname: worker-4
     environment:
-      - PYTHONUNBUFFERED=1
-    networks:
-      - mapreduce-net
-    command: python worker.py
-
-  worker-5:
-    build: .
-    container_name: worker-5
-    hostname: worker-5
-    environment:
-      - PYTHONUNBUFFERED=1
-    networks:
-      - mapreduce-net
-    command: python worker.py
-
-  worker-6:
-    build: .
-    container_name: worker-6
-    hostname: worker-6
-    environment:
-      - PYTHONUNBUFFERED=1
-    networks:
-      - mapreduce-net
-    command: python worker.py
-
-  worker-7:
-    build: .
-    container_name: worker-7
-    hostname: worker-7
-    environment:
-      - PYTHONUNBUFFERED=1
-    networks:
-      - mapreduce-net
-    command: python worker.py
-
-  worker-8:
-    build: .
-    container_name: worker-8
-    hostname: worker-8
-    environment:
-      - PYTHONUNBUFFERED=1
-    networks:
-      - mapreduce-net
-    command: python worker.py
-
-  coordinator:
-    build: .
-    container_name: coordinator
-    hostname: coordinator
-    environment:
+      - COORDINATOR_HOST=coordinator
       - PYTHONUNBUFFERED=1
     volumes:
       - ./txt:/app/txt
-      - ./coordinator.py:/app/coordinator.py
-    command: python -u coordinator.py
     depends_on:
-      - worker-1
-      - worker-2
-      - worker-3
-      - worker-4
-      - worker-5
-      - worker-6
-      - worker-7
-      - worker-8
-    networks:
-      - mapreduce-net
+      - coordinator
 
 networks:
   mapreduce-net:

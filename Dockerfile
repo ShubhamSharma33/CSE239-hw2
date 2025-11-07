@@ -1,16 +1,12 @@
-FROM python:3.9-slim
+FROM python:3.11-slim
 
 WORKDIR /app
 
-# Install dependencies
-RUN pip install rpyc
+RUN pip install --no-cache-dir rpyc
 
-# Copy files
-COPY worker.py .
 COPY coordinator.py .
+COPY worker.py .
 
-# Expose RPyC port
-EXPOSE 18861
+RUN mkdir -p txt
 
-# Default command (can be overridden in docker-compose)
-CMD ["python", "worker.py"]
+CMD ["python", "coordinator.py"]

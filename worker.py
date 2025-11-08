@@ -54,7 +54,7 @@ def worker_main():
                 config={
                     "allow_public_attrs": True,
                     "allow_pickle": True,
-                    "sync_request_timeout": 60  # Increased timeout
+                    "sync_request_timeout": 300  # Increased timeout for large data
                 }
             )
             print(f"[{worker_id}] Connected to coordinator!")
@@ -104,29 +104,107 @@ def worker_main():
                 print(f"[{worker_id}] Received MAP task {task_id}")
                 # Execute map function
                 result = map_function(task_data)
-                # Submit result
-                try:
-                    success = coordinator_conn.root.submit_map_result(task_id, result, worker_id)
-                    if success:
-                        print(f"[{worker_id}] Completed MAP task {task_id}")
-                    else:
-                        print(f"[{worker_id}] Failed to submit MAP task {task_id} result")
-                except Exception as e:
-                    print(f"[{worker_id}] Error submitting map result: {e}")
+                
+                # Ensure result is a plain dict (not RPyC proxy)
+                if not isinstance(result, dict):
+                    result = dict(result)
+                
+                print(f"[{worker_id}] Map task {task_id} produced {len(result)} unique words")
+                
+                # Submit result with retry logic
+                max_submit_retries = 3
+                submit_success = False
+                
+                for submit_attempt in range(max_submit_retries):
+                    try:
+                        # Submit result (connection will be checked by the RPC call itself)
+                        success = coordinator_conn.root.submit_map_result(task_id, result, worker_id)
+                        if success:
+                            print(f"[{worker_id}] Completed MAP task {task_id}")
+                            submit_success = True
+                            break
+                        else:
+                            print(f"[{worker_id}] Coordinator rejected MAP task {task_id} result (attempt {submit_attempt + 1})")
+                            if submit_attempt < max_submit_retries - 1:
+                                time.sleep(1)
+                    except (ConnectionError, EOFError, OSError) as e:
+                        print(f"[{worker_id}] Connection error submitting map result (attempt {submit_attempt + 1}): {e}")
+                        if submit_attempt < max_submit_retries - 1:
+                            time.sleep(2)
+                            # Try to reconnect
+                            try:
+                                coordinator_conn = rpyc.connect(
+                                    coordinator_host,
+                                    coordinator_port,
+                                    config={
+                                        "allow_public_attrs": True,
+                                        "allow_pickle": True,
+                                        "sync_request_timeout": 300
+                                    }
+                                )
+                            except Exception as reconnect_err:
+                                print(f"[{worker_id}] Failed to reconnect: {reconnect_err}")
+                    except Exception as e:
+                        error_type = type(e).__name__
+                        print(f"[{worker_id}] Error submitting map result (attempt {submit_attempt + 1}): {error_type}: {e}")
+                        if submit_attempt < max_submit_retries - 1:
+                            time.sleep(1)
+                
+                if not submit_success:
+                    print(f"[{worker_id}] Failed to submit MAP task {task_id} after {max_submit_retries} attempts")
             
             elif task_type == "reduce":
                 print(f"[{worker_id}] Received REDUCE task {task_id}")
                 # Execute reduce function
                 result = reduce_function(task_data)
-                # Submit result
-                try:
-                    success = coordinator_conn.root.submit_reduce_result(task_id, result, worker_id)
-                    if success:
-                        print(f"[{worker_id}] Completed REDUCE task {task_id}")
-                    else:
-                        print(f"[{worker_id}] Failed to submit REDUCE task {task_id} result")
-                except Exception as e:
-                    print(f"[{worker_id}] Error submitting reduce result: {e}")
+                
+                # Ensure result is a plain dict
+                if not isinstance(result, dict):
+                    result = dict(result)
+                
+                print(f"[{worker_id}] Reduce task {task_id} processed {len(result)} words")
+                
+                # Submit result with retry logic
+                max_submit_retries = 3
+                submit_success = False
+                
+                for submit_attempt in range(max_submit_retries):
+                    try:
+                        # Submit result (connection will be checked by the RPC call itself)
+                        success = coordinator_conn.root.submit_reduce_result(task_id, result, worker_id)
+                        if success:
+                            print(f"[{worker_id}] Completed REDUCE task {task_id}")
+                            submit_success = True
+                            break
+                        else:
+                            print(f"[{worker_id}] Coordinator rejected REDUCE task {task_id} result (attempt {submit_attempt + 1})")
+                            if submit_attempt < max_submit_retries - 1:
+                                time.sleep(1)
+                    except (ConnectionError, EOFError, OSError) as e:
+                        print(f"[{worker_id}] Connection error submitting reduce result (attempt {submit_attempt + 1}): {e}")
+                        if submit_attempt < max_submit_retries - 1:
+                            time.sleep(2)
+                            # Try to reconnect
+                            try:
+                                coordinator_conn = rpyc.connect(
+                                    coordinator_host,
+                                    coordinator_port,
+                                    config={
+                                        "allow_public_attrs": True,
+                                        "allow_pickle": True,
+                                        "sync_request_timeout": 300
+                                    }
+                                )
+                            except Exception as reconnect_err:
+                                print(f"[{worker_id}] Failed to reconnect: {reconnect_err}")
+                    except Exception as e:
+                        error_type = type(e).__name__
+                        print(f"[{worker_id}] Error submitting reduce result (attempt {submit_attempt + 1}): {error_type}: {e}")
+                        if submit_attempt < max_submit_retries - 1:
+                            time.sleep(1)
+                
+                if not submit_success:
+                    print(f"[{worker_id}] Failed to submit REDUCE task {task_id} after {max_submit_retries} attempts")
             
             else:
                 print(f"[{worker_id}] Unknown task type: {task_type}")

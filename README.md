@@ -1,7 +1,7 @@
 # Dockerized MapReduce Word Count System
 
 ## Overview
-This project implements a distributed MapReduce system using Docker containers and RPyC (Remote Python Calls) for word counting on large text datasets. The system consists of one coordinator container and multiple worker containers that communicate via Docker networking.
+This assignment implements a distributed MapReduce system using Docker containers and RPyC (Remote Python Calls) for word counting on large text datasets. 
 
 ## Architecture
 ```
@@ -26,8 +26,8 @@ This project implements a distributed MapReduce system using Docker containers a
 
 ### 1. Clone the Repository
 ```bash
-git clone https://github.com/yourusername/mapreduce-docker.git
-cd mapreduce-docker
+git clone https://github.com/ShubhamSharma33/CSE239-hw2.git
+cd CSE239-hw2
 ```
 
 ### 2. Project Structure
@@ -72,52 +72,6 @@ docker-compose up --scale worker=8
 ```bash
 docker-compose down
 ```
-
-## File Descriptions
-
-### coordinator.py
-The coordinator manages the entire MapReduce workflow:
-- Downloads and prepares the dataset
-- Distributes map tasks to workers
-- Handles worker failures with 20-second timeout
-- Performs shuffle phase (grouping by keys)
-- Distributes reduce tasks
-- Aggregates final results
-- Reports execution time
-
-### worker.py
-```python
-import rpyc
-
-class MapReduceService(rpyc.Service):
-    def exposed_map(self, text_chunk):
-        """Map step: tokenize and count words in text chunk."""
-        word_count = {}
-        for word in text_chunk.lower().split():
-            word = ''.join(c for c in word if c.isalnum())
-            if word:
-                word_count[word] = word_count.get(word, 0) + 1
-        return word_count
-    
-    def exposed_reduce(self, grouped_items):
-        """Reduce step: sum counts for a subset of words."""
-        result = {}
-        for word, counts in grouped_items.items():
-            result[word] = sum(counts)
-        return result
-
-if __name__ == "__main__":
-    from rpyc.utils.server import ThreadedServer
-    t = ThreadedServer(MapReduceService, port=18865)
-    print("[Worker] Starting RPyC service on port 18865...")
-    t.start()
-```
-
-### Dockerfile
-```dockerfile
-FROM python:3.9-slim
-
-WORKDIR /app
 
 # Install dependencies
 RUN pip install --no-cache-dir rpyc requests
@@ -205,16 +159,72 @@ docker-compose run coordinator python coordinator.py
 # Modify DATA_URL in docker-compose.yml to use enwik8.zip
 ```
 
-**Test with custom dataset:**
-```bash
-docker-compose run -e DATA_URL=http://your-dataset-url.zip coordinator python coordinator.py
+### Variable Worker Configurations
+
+To run with different numbers of workers, comment out unused workers in both `coordinator.py` and `docker-compose.yml`:
+
+#### For 1 Worker:
+In `coordinator.py`, comment out workers 2-8:
+```python
+WORKERS = [
+    ("worker-1", 18865),
+    # ("worker-2", 18865),
+    # ("worker-3", 18865),
+    # ... (comment out rest)
+]
 ```
 
-## Performance Metrics
-The system reports:
-- Total execution time
-- Top 20 most frequent words
-- Individual phase completion times (Map, Shuffle, Reduce)
+In `docker-compose.yml`, comment out worker services 2-8/remove comments from:
+```yaml
+services:
+  worker-1:
+    # ... configuration
+  # worker-2:
+  #   # ... commented out
+  # worker-3:
+  #   # ... commented out
+```
+
+and in the same file comment out/remove comments from:
+```yaml
+depends_on:
+      - worker-1
+      # - worker-2
+      # - worker-3
+      # - worker-4
+      ...
+      ...
+```
+
+Then run: `docker-compose up --build`
+
+#### For 2 Workers:
+Comment out workers 3-8 in both files and run: `docker-compose down` and then `docker-compose up`
+
+#### For 4 Workers:
+Comment out workers 5-8 in both files and run: `docker-compose down` and then `docker-compose up`
+
+#### For 8 Workers:
+Remove all commented workers in both files and run: `docker-compose down` and then `docker-compose up`
+
+### Using Different Datasets
+
+Default dataset is enwik9 (~1GB). To use enwik8 (~100MB) for testing:
+```bash
+docker-compose run -e DATA_URL="https://mattmahoney.net/dc/enwik8.zip" coordinator
+```
+
+## Performance Results
+
+Testing with enwik8 dataset on M4 Mac:
+
+| Workers | Execution Time | Speedup |
+|---------|---------------|---------|
+| 1 | 100.04 seconds | 1.00× |
+| 2 | 44.23 seconds | 2.26× |
+| 4 | 25.02 seconds | 4.00× |
+| 8 | 18.57 seconds | 5.39× |
+ 
 
 ## Troubleshooting
 

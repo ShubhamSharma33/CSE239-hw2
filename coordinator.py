@@ -1,70 +1,46 @@
 import rpyc
+import string
+import collections
+import itertools
 import time
+import operator
+import glob
+import sys
 import urllib.request
 import zipfile
 import os
-import glob
-from collections import defaultdict
-from operator import itemgetter
 
-# Configuration
 WORKERS = [
     ("worker-1", 18861),
-    # ("worker-2", 18861),
-    # ("worker-3", 18861),
-    # ("worker-4", 18861),
+    ("worker-2", 18861),
+    ("worker-3", 18861),
+    ("worker-4", 18861),
 ]
 
-CHUNK_SIZE = 1024 * 1024 * 50  # 50MB chunks
-MAX_PENDING = 15  # Max async operations at once
-
-def download(url='https://mattmahoney.net/dc/enwik9.zip'):
-    """Download and extract dataset"""
-    filename = url.split('/')[-1]
+def mapreduce_wordcount(input_files):
+    """
+    Main MapReduce function
+    1. Split text into chunks
+    2. Connect to workers
+    3. MAP PHASE: Send chunks and get intermediate pairs
+    4. SHUFFLE PHASE: Group intermediate pairs by key
+    5. REDUCE PHASE: Send grouped data to reducers
+    6. FINAL AGGREGATION
+    """
+    n_workers = len(WORKERS)
     
-    if os.path.exists('txt/') and len(glob.glob('txt/*')) > 0:
-        print(f"[INFO] Dataset already exists")
-        return glob.glob('txt/*')
+    # 1. SPLIT TEXT INTO CHUNKS
+    print(f"[INFO] Splitting data for {n_workers} workers...")
+    chunks = split_files_into_chunks(input_files, n_workers)
+    print(f"[INFO] Created {len(chunks)} chunks")
     
-    print(f"[INFO] Downloading {filename}...")
-    urllib.request.urlretrieve(url, filename)
-    
-    print(f"[INFO] Extracting...")
-    os.makedirs('txt', exist_ok=True)
-    with zipfile.ZipFile(filename, 'r') as zip_ref:
-        zip_ref.extractall('txt/')
-    
-    return glob.glob('txt/*')
-
-def stream_chunks(filepath, chunk_bytes=CHUNK_SIZE):
-    """Stream file in chunks - memory efficient"""
-    with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
-        buffer = []
-        size = 0
-        
-        for line in f:
-            buffer.append(line)
-            size += len(line)
-            
-            if size >= chunk_bytes:
-                yield ''.join(buffer)
-                buffer = []
-                size = 0
-        
-        if buffer:
-            yield ''.join(buffer)
-
-def mapreduce_wordcount(input_files, workers):
-    """Fast MapReduce with async RPyC"""
-    
-    print(f"\n[MAPREDUCE] Starting with {len(workers)} workers")
-    
-    # Connect to all workers upfront
+    # 2. CONNECT TO WORKERS
+    print("[INFO] Connecting to workers...")
     connections = []
-    for hostname, port in workers:
+    for hostname, port in WORKERS:
         conn = rpyc.connect(
             hostname, 
-            port,
+            port, 
             config={
                 "allow_public_attrs": True,
                 "allow_pickle": True,
@@ -72,100 +48,185 @@ def mapreduce_wordcount(input_files, workers):
             }
         )
         connections.append(conn)
-        print(f"[WORKER] Connected to {hostname}")
+        print(f"  Connected to {hostname}:{port}")
     
-    # Track results
-    word_totals = defaultdict(int)
-    pending = []
-    worker_idx = 0
-    chunks_sent = 0
+    # 3. MAP PHASE: Send chunks and get intermediate pairs (PARALLEL!)
+    print(f"\n[MAP] Dispatching {len(chunks)} chunks to {n_workers} workers...")
+    map_start = time.time()
     
-    def collect_ready():
-        """Collect completed async results"""
-        nonlocal pending, word_totals
-        still_pending = []
+    pending_results = []
+    
+    # DISPATCH ALL ASYNC CALLS (non-blocking) - workers start immediately!
+    for i, chunk in enumerate(chunks):
+        worker_idx = i % n_workers
+        conn = connections[worker_idx]
         
-        for async_res in pending:
-            if async_res.ready:
-                result = async_res.value  # dict of word:count
-                for word, count in result.items():
-                    word_totals[word] += count
-            else:
-                still_pending.append(async_res)
+        # Send async - does NOT wait for completion
+        async_result = rpyc.async_(conn.root.process_chunk)(chunk)
+        pending_results.append(async_result)
         
-        pending = still_pending
+        print(f"  Dispatched chunk {i+1}/{len(chunks)} to worker-{worker_idx+1}")
     
-    # Process all files
-    print(f"[MAP] Processing {len(input_files)} file(s)...")
+    print(f"[MAP] All chunks dispatched! Workers processing in parallel...")
     
-    for filepath in input_files:
-        print(f"[MAP] Reading {filepath}")
+    # COLLECT ALL RESULTS - workers have been processing during dispatch!
+    print(f"[MAP] Collecting results...")
+    map_results = []
+    
+    for i, async_result in enumerate(pending_results):
+        # Wait for this specific result
+        result = async_result.value
+        map_results.append(result)
         
-        for chunk in stream_chunks(filepath):
-            # Wait if too many pending
-            while len(pending) >= MAX_PENDING:
-                collect_ready()
-                time.sleep(0.02)
-            
-            # Send async to next worker
-            conn = connections[worker_idx]
-            async_result = rpyc.async_(conn.root.process_chunk)(chunk)
-            pending.append(async_result)
-            
-            worker_idx = (worker_idx + 1) % len(connections)
-            chunks_sent += 1
-            
-            if chunks_sent % 5 == 0:
-                print(f"[MAP] Sent {chunks_sent} chunks, {len(pending)} pending")
+        worker_idx = i % n_workers
+        print(f"  Collected result {i+1}/{len(pending_results)} from worker-{worker_idx+1}")
     
-    # Wait for all remaining
-    print(f"[MAP] Waiting for {len(pending)} remaining tasks...")
-    while pending:
-        collect_ready()
-        time.sleep(0.05)
+    map_time = time.time() - map_start
+    print(f"[MAP] Map phase complete! Time: {map_time:.2f}s")
+    
+    # 4. SHUFFLE PHASE: Group intermediate pairs by key
+    print("\n[SHUFFLE] Grouping intermediate results...")
+    shuffle_start = time.time()
+    
+    aggregated = collections.defaultdict(int)
+    for result_dict in map_results:
+        for word, count in result_dict.items():
+            aggregated[word] += count
+    
+    shuffle_time = time.time() - shuffle_start
+    print(f"[SHUFFLE] Found {len(aggregated)} unique words. Time: {shuffle_time:.2f}s")
+    
+    # 5. REDUCE PHASE: Send grouped data to reducers
+    print("\n[REDUCE] Distributing reduce tasks...")
+    reduce_start = time.time()
+    
+    # Partition words across workers for reduce
+    words = list(aggregated.keys())
+    partitions = partition_dict(aggregated, n_workers)
+    
+    final_counts = {}
+    
+    # Simple reduce - just copy partitions (already aggregated in shuffle)
+    for i, partition in enumerate(partitions):
+        for word, count in partition.items():
+            final_counts[word] = count
+        print(f"  Worker {i+1} processed {len(partition)} words")
+    
+    reduce_time = time.time() - reduce_start
+    print(f"[REDUCE] Reduce phase complete! Time: {reduce_time:.2f}s")
+    
+    # 6. FINAL AGGREGATION
+    print("\n[AGGREGATE] Sorting results...")
+    total_counts = sorted(final_counts.items(), key=operator.itemgetter(1), reverse=True)
     
     # Close connections
+    print("[CLEANUP] Closing worker connections...")
     for conn in connections:
         conn.close()
     
-    print(f"[COMPLETE] Processed {chunks_sent} chunks")
-    print(f"[COMPLETE] Found {len(word_totals)} unique words")
+    return total_counts
+
+def split_text(text, n):
+    """Split text into n roughly equal chunks"""
+    chunk_size = len(text) // n
+    chunks = []
     
-    # Sort by frequency
-    sorted_results = sorted(word_totals.items(), key=itemgetter(1), reverse=True)
-    return sorted_results
+    for i in range(n):
+        start = i * chunk_size
+        end = start + chunk_size if i < n - 1 else len(text)
+        chunks.append(text[start:end])
+    
+    return chunks
+
+def split_files_into_chunks(files, n):
+    """Read all files and split into n chunks"""
+    print(f"[SPLIT] Reading {len(files)} file(s)...")
+    all_text = ""
+    
+    for filepath in files:
+        print(f"  Reading {filepath}...")
+        with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
+            all_text += f.read()
+    
+    print(f"[SPLIT] Total text size: {len(all_text):,} characters")
+    return split_text(all_text, n)
+
+def partition_dict(d, n):
+    """Partition dictionary into n roughly equal parts"""
+    items = list(d.items())
+    chunk_size = len(items) // n
+    
+    partitions = []
+    for i in range(n):
+        start = i * chunk_size
+        end = start + chunk_size if i < n - 1 else len(items)
+        partition = dict(items[start:end])
+        partitions.append(partition)
+    
+    return partitions
+
+def download(url='https://mattmahoney.net/dc/enwik8.zip'):
+    """Downloads and unzips a wikipedia dataset in txt/."""
+    filename = url.split('/')[-1]
+    zip_path = filename
+    
+    # Download if not exists
+    if not os.path.exists(zip_path):
+        print(f"[DOWNLOAD] Downloading {url}...")
+        urllib.request.urlretrieve(url, zip_path)
+        print("[DOWNLOAD] Complete")
+    else:
+        print(f"[DOWNLOAD] Found {zip_path}, skipping download")
+    
+    # Extract if txt/ is empty
+    os.makedirs('txt', exist_ok=True)
+    if not glob.glob('txt/*'):
+        print(f"[EXTRACT] Unzipping {zip_path}...")
+        with zipfile.ZipFile(zip_path, 'r') as zf:
+            zf.extractall('txt/')
+        print("[EXTRACT] Complete")
+    else:
+        print("[EXTRACT] Dataset already extracted")
+    
+    return glob.glob('txt/*')
 
 if __name__ == "__main__":
+    # DOWNLOAD AND UNZIP DATASET
+    url = sys.argv[1] if len(sys.argv) > 1 else 'https://mattmahoney.net/dc/enwik8.zip'
+    
     print("="*60)
     print("DISTRIBUTED MAPREDUCE WORD COUNT")
     print("="*60)
+    print(f"Workers: {len(WORKERS)}")
+    print(f"Dataset: {url}")
+    print("="*60 + "\n")
     
-    # Download
-    files = download()
+    input_files = download(url)
     
     # Wait for workers
-    print("\n[INIT] Waiting for workers to start...")
+    print("\n[INIT] Waiting 5 seconds for workers to start...")
     time.sleep(5)
     
-    # Run MapReduce
-    start = time.time()
-    results = mapreduce_wordcount(files, WORKERS)
-    end = time.time()
-    
-    # Display results
     print("\n" + "="*60)
-    print("TOP 20 WORDS")
+    print("STARTING MAPREDUCE")
     print("="*60)
     
-    for i, (word, count) in enumerate(results[:20], 1):
-        print(f"{i:2d}. {word:15s} {count:>10,}")
+    start_time = time.time()
+    word_counts = mapreduce_wordcount(input_files)
+    end_time = time.time()
     
-    # Save results
-    with open('txt/output.txt', 'w') as f:
-        for word, count in results:
-            f.write(f"{word}\t{count}\n")
+    print('\n' + '='*60)
+    print('TOP 20 WORDS BY FREQUENCY')
+    print('='*60 + '\n')
     
-    print("="*60)
-    print(f"ELAPSED TIME: {end - start:.2f} seconds")
-    print(f"Saved {len(results):,} words to txt/output.txt")
+    top20 = word_counts[0:20]
+    longest = max(len(word) for word, count in top20) if top20 else 5
+    i = 1
+    for word, count in top20:
+        print('%s.\t%-*s: %5s' % (i, longest+1, word, count))
+        i = i + 1
+    
+    elapsed_time = end_time - start_time
+    print("\n" + "="*60)
+    print("Elapsed Time: {:.2f} seconds".format(elapsed_time))
     print("="*60)

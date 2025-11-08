@@ -106,46 +106,6 @@ RUN pip install --no-cache-dir rpyc requests
 # Copy application files
 COPY coordinator.py worker.py ./
 
-# Default to worker mode
-CMD ["python", "worker.py"]
-```
-
-### docker-compose.yml
-```yaml
-version: '3.8'
-
-services:
-  coordinator:
-    build: .
-    container_name: coordinator
-    command: python coordinator.py
-    environment:
-      - DATA_URL=https://mattmahoney.net/dc/enwik9.zip
-    depends_on:
-      - worker
-    networks:
-      - mapreduce-net
-    volumes:
-      - ./txt:/app/txt
-
-  worker:
-    build: .
-    networks:
-      - mapreduce-net
-    deploy:
-      replicas: 3
-
-networks:
-  mapreduce-net:
-    driver: bridge
-```
-
-### requirements.txt
-```
-rpyc==5.3.1
-requests==2.31.0
-```
-
 ## Key Features
 
 ### 1. Fault Tolerance

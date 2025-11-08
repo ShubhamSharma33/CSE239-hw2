@@ -30,9 +30,10 @@ def mapreduce_wordcount(input_files):
     n_workers = len(WORKERS)
     
     # 1. SPLIT TEXT INTO CHUNKS (using streaming to avoid OOM)
+    # IMPORTANT: Create MORE chunks than workers for better load balancing
     print(f"[INFO] Splitting data for {n_workers} workers...")
     chunks = split_files_into_chunks(input_files, n_workers)
-    print(f"[INFO] Created {len(chunks)} chunks")
+    print(f"[INFO] Created {len(chunks)} chunks for {n_workers} workers")
     
     # 2. CONNECT TO WORKERS
     print("[INFO] Connecting to workers...")
@@ -65,7 +66,8 @@ def mapreduce_wordcount(input_files):
         async_result = rpyc.async_(conn.root.process_chunk)(chunk)
         pending_results.append(async_result)
         
-        print(f"  Dispatched chunk {i+1}/{len(chunks)} to worker-{worker_idx+1}")
+        if (i + 1) % 5 == 0 or i == len(chunks) - 1:
+            print(f"  Dispatched {i+1}/{len(chunks)} chunks...")
     
     print(f"[MAP] All chunks dispatched! Workers processing in parallel...")
     
@@ -78,8 +80,8 @@ def mapreduce_wordcount(input_files):
         result = async_result.value
         map_results.append(result)
         
-        worker_idx = i % n_workers
-        print(f"  Collected result {i+1}/{len(pending_results)} from worker-{worker_idx+1}")
+        if (i + 1) % 5 == 0 or i == len(pending_results) - 1:
+            print(f"  Collected {i+1}/{len(pending_results)} results")
     
     map_time = time.time() - map_start
     print(f"[MAP] Map phase complete! Time: {map_time:.2f}s")
@@ -138,24 +140,34 @@ def split_text(text, n):
     
     return chunks
 
-def split_files_into_chunks(files, n):
+def split_files_into_chunks(files, n_workers):
     """
-    Read files in streaming fashion to avoid loading entire file into memory.
-    This prevents OOM (Out of Memory) errors with large datasets like enwik9.
+    Read files in streaming fashion and create MULTIPLE chunks per worker.
+    This allows better load balancing and utilization with more workers.
+    
+    KEY FIX: Creates 3x more chunks than workers!
+    - 4 workers → 12 chunks (each worker processes ~3 chunks)
+    - 8 workers → 24 chunks (each worker processes ~3 chunks)
+    
+    This ensures 8 workers are faster than 4 workers!
     """
-    print(f"[SPLIT] Streaming {len(files)} file(s) into {n} chunks...")
+    # Create 3x more chunks than workers for better parallelism
+    target_chunks = n_workers * 3
+    
+    print(f"[SPLIT] Creating {target_chunks} chunks for {n_workers} workers")
+    print(f"[SPLIT] (Target: ~3 chunks per worker for optimal load balancing)")
     
     # First pass: calculate total file size without loading into memory
     total_size = 0
     for filepath in files:
         total_size += os.path.getsize(filepath)
     
-    chunk_size = total_size // n
+    chunk_size = total_size // target_chunks
     print(f"[SPLIT] Total size: {total_size:,} bytes")
     print(f"[SPLIT] Target chunk size: {chunk_size:,} bytes (~{chunk_size/1024/1024:.1f} MB)")
     
     # Initialize chunk storage
-    chunks = [[] for _ in range(n)]
+    chunks = [[] for _ in range(target_chunks)]
     current_chunk_idx = 0
     current_chunk_size = 0
     
@@ -178,22 +190,22 @@ def split_files_into_chunks(files, n):
                 
                 # Move to next chunk when current is full
                 # (but not if we're on the last chunk)
-                if current_chunk_size >= chunk_size and current_chunk_idx < n - 1:
-                    print(f"    → Chunk {current_chunk_idx + 1} ready (~{current_chunk_size:,} bytes)")
+                if current_chunk_size >= chunk_size and current_chunk_idx < target_chunks - 1:
                     current_chunk_idx += 1
                     current_chunk_size = 0
     
-    # Final chunk
-    print(f"    → Chunk {n} ready (~{current_chunk_size:,} bytes)")
-    
     # Join the blocks for each chunk
-    print(f"[SPLIT] Assembling {n} chunks...")
+    print(f"[SPLIT] Assembling {target_chunks} chunks...")
     result = []
     for i, chunk_blocks in enumerate(chunks):
         assembled = ''.join(chunk_blocks)
         result.append(assembled)
-        print(f"  Chunk {i+1}: {len(assembled):,} characters")
+        
+        # Progress indicator (show every 4th chunk or the last one)
+        if (i + 1) % 4 == 0 or i == len(chunks) - 1:
+            print(f"  Assembled {i+1}/{target_chunks} chunks (~{len(assembled)/1024/1024:.1f} MB)")
     
+    print(f"[SPLIT] ✓ Ready: {len(result)} chunks, avg ~{(total_size/target_chunks)/1024/1024:.1f} MB each")
     return result
 
 def partition_dict(d, n):

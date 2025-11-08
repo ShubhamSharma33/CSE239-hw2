@@ -32,15 +32,33 @@ _coordinator_instance = None
 class CoordinatorService(rpyc.Service):
     def exposed_request_task(self, worker_id: str) -> Optional[Dict]:
         """Worker requests a task. Returns task or None if no tasks available."""
-        return _coordinator_instance._request_task(worker_id)
+        try:
+            return _coordinator_instance._request_task(worker_id)
+        except Exception as e:
+            print(f"[COORDINATOR] Error in request_task from {worker_id}: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
     
     def exposed_submit_map_result(self, task_id: int, result: Dict, worker_id: str) -> bool:
         """Worker submits map task result."""
-        return _coordinator_instance._submit_map_result(task_id, result, worker_id)
+        try:
+            return _coordinator_instance._submit_map_result(task_id, result, worker_id)
+        except Exception as e:
+            print(f"[COORDINATOR] Error in submit_map_result from {worker_id}: {e}")
+            import traceback
+            traceback.print_exc()
+            return False
     
     def exposed_submit_reduce_result(self, task_id: int, result: Dict, worker_id: str) -> bool:
         """Worker submits reduce task result."""
-        return _coordinator_instance._submit_reduce_result(task_id, result, worker_id)
+        try:
+            return _coordinator_instance._submit_reduce_result(task_id, result, worker_id)
+        except Exception as e:
+            print(f"[COORDINATOR] Error in submit_reduce_result from {worker_id}: {e}")
+            import traceback
+            traceback.print_exc()
+            return False
     
     def exposed_get_intermediate_data(self, partition: int) -> Dict:
         """Get intermediate data for a reduce partition."""
@@ -57,10 +75,16 @@ class Coordinator:
         self.reduce_results = {}
         self.next_task_id = 0
         self.num_reduce_tasks = 0
+        self.connected_workers = set()  # Track which workers have connected
         
     def _request_task(self, worker_id: str) -> Optional[Dict]:
         """Worker requests a task. Returns task or None if no tasks available."""
         with self.lock:
+            # Track connected workers
+            if worker_id not in self.connected_workers:
+                self.connected_workers.add(worker_id)
+                print(f"[COORDINATOR] Worker {worker_id} connected (total: {len(self.connected_workers)})")
+            
             # Check for timed out tasks first
             self._check_timeouts()
             
@@ -334,9 +358,35 @@ if __name__ == "__main__":
     time.sleep(2)
     
     # Wait for workers to start and connect to coordinator
-    print("\n[INIT] Waiting 10 seconds for workers to start and connect...")
-    time.sleep(10)
-    print("[INIT] Workers should now be connected to coordinator RPC server")
+    print("\n[INIT] Waiting for workers to connect...")
+    print("[INIT] Workers will connect as they start up...")
+    
+    # Wait and check for worker connections
+    max_wait = 30  # Maximum 30 seconds
+    check_interval = 2
+    waited = 0
+    
+    while waited < max_wait:
+        time.sleep(check_interval)
+        waited += check_interval
+        with coordinator.lock:
+            connected_count = len(coordinator.connected_workers)
+            print(f"[INIT] Connected workers: {connected_count}/{num_workers} (waited {waited}s)")
+            
+            # If we have at least one worker, we can proceed (others can join later)
+            if connected_count > 0:
+                print(f"[INIT] At least one worker connected, proceeding...")
+                break
+    
+    # Final check
+    with coordinator.lock:
+        final_count = len(coordinator.connected_workers)
+        if final_count == 0:
+            print("\n[WARNING] No workers connected! MapReduce may not work.")
+            print("[WARNING] Check worker logs to see connection errors.")
+            print("[WARNING] Proceeding anyway, but tasks may not complete...")
+        else:
+            print(f"[INIT] {final_count} worker(s) connected and ready")
     
     print("\n" + "="*60)
     print("STARTING MAPREDUCE")
@@ -347,12 +397,34 @@ if __name__ == "__main__":
     # Wait for map phase to complete
     print("\n[MAP] Waiting for map tasks to complete...")
     map_start = time.time()
+    last_progress = -1
+    no_progress_count = 0
+    
     while not all(t.completed for t in coordinator.map_tasks):
         time.sleep(1)
         completed = sum(1 for t in coordinator.map_tasks if t.completed)
         total = len(coordinator.map_tasks)
-        if completed % 5 == 0 or completed == total:
-            print(f"  Map progress: {completed}/{total} tasks completed")
+        
+        # Check if progress is stuck
+        if completed == last_progress:
+            no_progress_count += 1
+        else:
+            no_progress_count = 0
+            last_progress = completed
+        
+        # Print progress every 5 tasks or every 10 seconds if stuck
+        if completed % 5 == 0 or completed == total or no_progress_count % 10 == 0:
+            with coordinator.lock:
+                active_workers = len(coordinator.connected_workers)
+                assigned = sum(1 for t in coordinator.map_tasks if t.assigned_to is not None)
+            print(f"  Map progress: {completed}/{total} tasks completed | {assigned} assigned | {active_workers} workers connected")
+        
+        # Warn if stuck for too long
+        if no_progress_count > 30:
+            print(f"\n[WARNING] No progress for 30 seconds! Check worker logs.")
+            print(f"[WARNING] Connected workers: {len(coordinator.connected_workers)}")
+            print(f"[WARNING] Assigned tasks: {sum(1 for t in coordinator.map_tasks if t.assigned_to is not None)}")
+            no_progress_count = 0  # Reset counter
     
     map_time = time.time() - map_start
     print(f"[MAP] Map phase complete! Time: {map_time:.2f}s")

@@ -4,7 +4,6 @@
 
 Shubham Sharma  
 CSE 239 - Advanced Cloud Computing  
-UC Santa Cruz
 
 A distributed MapReduce implementation using Docker containers and RPyC for large-scale word frequency analysis.
 

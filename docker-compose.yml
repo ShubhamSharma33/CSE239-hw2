@@ -71,6 +71,7 @@ services:
     hostname: coordinator
     environment:
       - PYTHONUNBUFFERED=1
+      - DATA_URL=https://mattmahoney.net/dc/enwik9.zip
     volumes:
       - ./txt:/app/txt
       - ./coordinator.py:/app/coordinator.py

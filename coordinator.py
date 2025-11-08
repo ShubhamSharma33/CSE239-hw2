@@ -29,7 +29,7 @@ def mapreduce_wordcount(input_files):
     """
     n_workers = len(WORKERS)
     
-    # 1. SPLIT TEXT INTO CHUNKS
+    # 1. SPLIT TEXT INTO CHUNKS (using streaming to avoid OOM)
     print(f"[INFO] Splitting data for {n_workers} workers...")
     chunks = split_files_into_chunks(input_files, n_workers)
     print(f"[INFO] Created {len(chunks)} chunks")
@@ -139,17 +139,62 @@ def split_text(text, n):
     return chunks
 
 def split_files_into_chunks(files, n):
-    """Read all files and split into n chunks"""
-    print(f"[SPLIT] Reading {len(files)} file(s)...")
-    all_text = ""
+    """
+    Read files in streaming fashion to avoid loading entire file into memory.
+    This prevents OOM (Out of Memory) errors with large datasets like enwik9.
+    """
+    print(f"[SPLIT] Streaming {len(files)} file(s) into {n} chunks...")
+    
+    # First pass: calculate total file size without loading into memory
+    total_size = 0
+    for filepath in files:
+        total_size += os.path.getsize(filepath)
+    
+    chunk_size = total_size // n
+    print(f"[SPLIT] Total size: {total_size:,} bytes")
+    print(f"[SPLIT] Target chunk size: {chunk_size:,} bytes (~{chunk_size/1024/1024:.1f} MB)")
+    
+    # Initialize chunk storage
+    chunks = [[] for _ in range(n)]
+    current_chunk_idx = 0
+    current_chunk_size = 0
+    
+    # Second pass: read in blocks and distribute
+    BLOCK_SIZE = 1024 * 1024  # 1MB blocks - prevents loading entire file
     
     for filepath in files:
-        print(f"  Reading {filepath}...")
+        print(f"  Streaming {filepath}...")
+        
         with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
-            all_text += f.read()
+            while True:
+                # Read small block instead of entire file
+                block = f.read(BLOCK_SIZE)
+                if not block:
+                    break
+                
+                # Add block to current chunk
+                chunks[current_chunk_idx].append(block)
+                current_chunk_size += len(block)
+                
+                # Move to next chunk when current is full
+                # (but not if we're on the last chunk)
+                if current_chunk_size >= chunk_size and current_chunk_idx < n - 1:
+                    print(f"    → Chunk {current_chunk_idx + 1} ready (~{current_chunk_size:,} bytes)")
+                    current_chunk_idx += 1
+                    current_chunk_size = 0
     
-    print(f"[SPLIT] Total text size: {len(all_text):,} characters")
-    return split_text(all_text, n)
+    # Final chunk
+    print(f"    → Chunk {n} ready (~{current_chunk_size:,} bytes)")
+    
+    # Join the blocks for each chunk
+    print(f"[SPLIT] Assembling {n} chunks...")
+    result = []
+    for i, chunk_blocks in enumerate(chunks):
+        assembled = ''.join(chunk_blocks)
+        result.append(assembled)
+        print(f"  Chunk {i+1}: {len(assembled):,} characters")
+    
+    return result
 
 def partition_dict(d, n):
     """Partition dictionary into n roughly equal parts"""
@@ -165,7 +210,7 @@ def partition_dict(d, n):
     
     return partitions
 
-def download(url='https://mattmahoney.net/dc/enwik8.zip'):
+def download(url='https://mattmahoney.net/dc/enwik9.zip'):
     """Downloads and unzips a wikipedia dataset in txt/."""
     filename = url.split('/')[-1]
     zip_path = filename
@@ -173,6 +218,7 @@ def download(url='https://mattmahoney.net/dc/enwik8.zip'):
     # Download if not exists
     if not os.path.exists(zip_path):
         print(f"[DOWNLOAD] Downloading {url}...")
+        print(f"[DOWNLOAD] This may take several minutes for enwik9 (~300MB)...")
         urllib.request.urlretrieve(url, zip_path)
         print("[DOWNLOAD] Complete")
     else:
@@ -182,6 +228,7 @@ def download(url='https://mattmahoney.net/dc/enwik8.zip'):
     os.makedirs('txt', exist_ok=True)
     if not glob.glob('txt/*'):
         print(f"[EXTRACT] Unzipping {zip_path}...")
+        print(f"[EXTRACT] This will create a ~1GB file...")
         with zipfile.ZipFile(zip_path, 'r') as zf:
             zf.extractall('txt/')
         print("[EXTRACT] Complete")
@@ -191,8 +238,8 @@ def download(url='https://mattmahoney.net/dc/enwik8.zip'):
     return glob.glob('txt/*')
 
 if __name__ == "__main__":
-    # DOWNLOAD AND UNZIP DATASET
-    url = sys.argv[1] if len(sys.argv) > 1 else 'https://mattmahoney.net/dc/enwik8.zip'
+    # DOWNLOAD AND UNZIP DATASET (defaults to enwik9)
+    url = sys.argv[1] if len(sys.argv) > 1 else 'https://mattmahoney.net/dc/enwik9.zip'
     
     print("="*60)
     print("DISTRIBUTED MAPREDUCE WORD COUNT")

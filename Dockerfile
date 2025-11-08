@@ -1,12 +1,17 @@
-FROM python:3.11-slim
 
+FROM python:3.10-slim
+
+# Set working directory
 WORKDIR /app
 
-RUN pip install --no-cache-dir rpyc
+# Copy project files
+COPY . /app
 
-COPY coordinator.py .
-COPY worker.py .
+# Install dependencies
+RUN pip install --no-cache-dir rpyc requests
 
-RUN mkdir -p txt
+# Expose port if needed (for coordinator UI or worker)
+EXPOSE 18861
 
+# Run coordinator script
 CMD ["python", "coordinator.py"]

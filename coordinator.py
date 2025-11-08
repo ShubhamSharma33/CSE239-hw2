@@ -1,279 +1,273 @@
 import rpyc
-import string
 import collections
-import itertools
 import time
-import operator
-import glob
-import sys
-import urllib.request
-import zipfile
 import os
+import requests
+import zipfile
+import sys
+import concurrent.futures
+import json
+import pickle
 
+# worker hostnames and ports for rpyc connections
 WORKERS = [
-    ("worker-1", 18861),
-    ("worker-2", 18861),
-    ("worker-3", 18861),
-    ("worker-4", 18861),
+    ("worker-1", 18865),
+    ("worker-2", 18865),
+    ("worker-3", 18865),
+    ("worker-4", 18865),
+    ("worker-5", 18865),
+    ("worker-6", 18865),
+    ("worker-7", 18865),
+    ("worker-8", 18865)
 ]
 
-def mapreduce_wordcount(input_files):
+
+def mapreduce_wordcount(text):
+    start_time = time.time()
     """
-    Main MapReduce function
+    Executes a complete MapReduce word count job across all workers.
     1. Split text into chunks
     2. Connect to workers
-    3. MAP PHASE: Send chunks and get intermediate pairs
+    3. MAP PHASE: Send chunks in PARALLEL with retry logic
     4. SHUFFLE PHASE: Group intermediate pairs by key
-    5. REDUCE PHASE: Send grouped data to reducers
+    5. REDUCE PHASE: Send partitions in PARALLEL with retry logic
     6. FINAL AGGREGATION
     """
-    n_workers = len(WORKERS)
+    print("[Coordinator] Starting MapReduce job...")
+
+
+    worker_connections = []
+    for host, port in WORKERS:
+        try:
+            print(f"[COORDINATOR] Establishing connection with {host} on port {port}...")
+            conn = rpyc.connect(host, port, config={
+                "allow_pickle": True,    
+                "allow_all_attrs": True,    
+                "allow_getattr": True,
+                "sync_request_timeout": 250,
+            })
+            worker_connections.append(conn)
+        except Exception as e:
+            print(f"[Coordinator] Failed to connect to {host}:{port} - {e}")
+
+    if not worker_connections:
+        raise RuntimeError("[COORDINATOR] Fatal: No worker nodes available for processing!")
     
-    # 1. SPLIT TEXT INTO CHUNKS (using streaming to avoid OOM)
-    print(f"[INFO] Splitting data for {n_workers} workers...")
-    chunks = split_files_into_chunks(input_files, n_workers)
-    print(f"[INFO] Created {len(chunks)} chunks")
+
+    n_workers = len(worker_connections)
+
+    # create more chunks than workers for better load balancing
+    num_chunks = n_workers*8
+    chunks = split_text(text, num_chunks)
+
+    # using thread pool to send chunks to workers concurrently
+    thread_pool_size = min(len(chunks), len(worker_connections)*8)
+    print("[Coordinator] Starting MAP phase with parallel execution...")
     
-    # 2. CONNECT TO WORKERS
-    print("[INFO] Connecting to workers...")
-    connections = []
-    for hostname, port in WORKERS:
-        conn = rpyc.connect(
-            hostname, 
-            port, 
-            config={
-                "allow_public_attrs": True,
-                "allow_pickle": True,
-                "sync_request_timeout": 120
-            }
-        )
-        connections.append(conn)
-        print(f"  Connected to {hostname}:{port}")
-    
-    # 3. MAP PHASE: Send chunks and get intermediate pairs (PARALLEL!)
-    print(f"\n[MAP] Dispatching {len(chunks)} chunks to {n_workers} workers...")
-    map_start = time.time()
-    
-    pending_results = []
-    
-    # DISPATCH ALL ASYNC CALLS (non-blocking) - workers start immediately!
-    for i, chunk in enumerate(chunks):
-        worker_idx = i % n_workers
-        conn = connections[worker_idx]
+    def process_chunk(args):
+        """Helper function to process a chunk with retry logic"""
+        chunk_idx, chunk, worker_connections = args
+        max_retries = len(worker_connections)
         
-        # Send async - does NOT wait for completion
-        async_result = rpyc.async_(conn.root.process_chunk)(chunk)
-        pending_results.append(async_result)
+        for retry_count in range(max_retries):
+            try:
+                worker_idx = (chunk_idx + retry_count) % len(worker_connections)
+                conn = worker_connections[worker_idx]
+                
+                print(f"[COORDINATOR] Assigning segment {chunk_idx} to node-{worker_idx+1} (try #{retry_count+1})")
+                
+                result = conn.root.map(chunk)
+                
+                print(f"[COORDINATOR] Node-{worker_idx+1} processed segment {chunk_idx}: found {len(result)} distinct words")
+                return result
+                
+            except Exception as e:
+                print(f"[Coordinator] Error on worker-{worker_idx+1} for chunk {chunk_idx}: {e}")
+                if retry_count >= max_retries - 1:
+                    raise RuntimeError(f"Failed to process chunk {chunk_idx} after {max_retries} attempts")
+                print(f"[Coordinator] Retrying chunk {chunk_idx}...")
+                time.sleep(1)
+
+
+    with concurrent.futures.ThreadPoolExecutor(thread_pool_size) as executor:
+        chunk_args = [(i, chunk, worker_connections) for i, chunk in enumerate(chunks)]
+        map_results = list(executor.map(process_chunk, chunk_args))
+    
+    print(f"[COORDINATOR] Mapping finished. Collected {len(map_results)} intermediate results.")
+    
+
+    print("[COORDINATOR] Reorganizing intermediate data by keys...")
+    
+    # grouping all values by key across all map results
+    grouped = collections.defaultdict(list)
+    for partial_dict in map_results:
+        for key, value in partial_dict.items():
+            grouped[key].append(value)
+
+
+    print("[COORDINATOR] Beginning parallel reduction across worker nodes...")
+    partitions = partition_dict(grouped, n_workers)
+    
+    def process_partition(args):
+        """Helper function to process a partition with retry logic"""
+        partition_idx, partition, worker_connections = args
+        max_retries = len(worker_connections)
         
-        print(f"  Dispatched chunk {i+1}/{len(chunks)} to worker-{worker_idx+1}")
+         # retrying with different workers if one fails
+        for retry_count in range(max_retries):
+            try:
+                worker_idx = (partition_idx + retry_count) % len(worker_connections)
+                conn = worker_connections[worker_idx]
+                
+                print(f"[Coordinator] Partition {partition_idx} -> worker-{worker_idx+1} (attempt {retry_count+1})")
+                
+                # partition_str = json.dumps(partition)
+                # result = conn.root.reduce(partition_str)
+                result=conn.root.reduce(partition)
+                
+                print(f"[Coordinator] Worker-{worker_idx+1} completed partition {partition_idx}: {len(result)} keys")
+                return result
+                
+            except Exception as e:
+                print(f"[Coordinator] Error on worker-{worker_idx+1} for partition {partition_idx}: {e}")
+                if retry_count >= max_retries - 1:
+                    raise RuntimeError(f"Failed to process partition {partition_idx} after {max_retries} attempts")
+                print(f"[Coordinator] Retrying partition {partition_idx}...")
+                time.sleep(1)
     
-    print(f"[MAP] All chunks dispatched! Workers processing in parallel...")
+
+    with concurrent.futures.ThreadPoolExecutor(thread_pool_size) as executor:
+        partition_args = [(i, partition, worker_connections) for i, partition in enumerate(partitions)]
+        reduced_results = list(executor.map(process_partition, partition_args))
     
-    # COLLECT ALL RESULTS - workers have been processing during dispatch!
-    print(f"[MAP] Collecting results...")
-    map_results = []
-    
-    for i, async_result in enumerate(pending_results):
-        # Wait for this specific result
-        result = async_result.value
-        map_results.append(result)
-        
-        worker_idx = i % n_workers
-        print(f"  Collected result {i+1}/{len(pending_results)} from worker-{worker_idx+1}")
-    
-    map_time = time.time() - map_start
-    print(f"[MAP] Map phase complete! Time: {map_time:.2f}s")
-    
-    # 4. SHUFFLE PHASE: Group intermediate pairs by key
-    print("\n[SHUFFLE] Grouping intermediate results...")
-    shuffle_start = time.time()
-    
-    aggregated = collections.defaultdict(int)
-    for result_dict in map_results:
-        for word, count in result_dict.items():
-            aggregated[word] += count
-    
-    shuffle_time = time.time() - shuffle_start
-    print(f"[SHUFFLE] Found {len(aggregated)} unique words. Time: {shuffle_time:.2f}s")
-    
-    # 5. REDUCE PHASE: Send grouped data to reducers
-    print("\n[REDUCE] Distributing reduce tasks...")
-    reduce_start = time.time()
-    
-    # Partition words across workers for reduce
-    words = list(aggregated.keys())
-    partitions = partition_dict(aggregated, n_workers)
-    
+    end_time = time.time()
+    elapsed_time = end_time - start_time
+    print("Elapsed Time: {} before Aggregation to count Bottleneck".format(elapsed_time))
+
+
+    print("[COORDINATOR] giving final results...")
+
     final_counts = {}
-    
-    # Simple reduce - just copy partitions (already aggregated in shuffle)
-    for i, partition in enumerate(partitions):
-        for word, count in partition.items():
-            final_counts[word] = count
-        print(f"  Worker {i+1} processed {len(partition)} words")
-    
-    reduce_time = time.time() - reduce_start
-    print(f"[REDUCE] Reduce phase complete! Time: {reduce_time:.2f}s")
-    
-    # 6. FINAL AGGREGATION
-    print("\n[AGGREGATE] Sorting results...")
-    total_counts = sorted(final_counts.items(), key=operator.itemgetter(1), reverse=True)
-    
-    # Close connections
-    print("[CLEANUP] Closing worker connections...")
-    for conn in connections:
-        conn.close()
-    
-    return total_counts
+    for partial in reduced_results:
+        final_counts.update(partial)
+
+
+    word_counts = sorted(final_counts.items(), key=lambda x: x[1], reverse=True)
+
+    print("[Coordinator] MapReduce completed!")
+
+    return word_counts
+
 
 def split_text(text, n):
-    """Split text into n roughly equal chunks"""
-    chunk_size = len(text) // n
+    """
+    Split text into n chunks aligned to full lines, never cutting inside words.
+    """
+    lines = text.splitlines()
+    total = len(lines)
+    
+    # Calculate chunk sizes (distribute remainder evenly)
+    base_size = total // n
+    remainder = total % n
+    
     chunks = []
+    start = 0
     
     for i in range(n):
-        start = i * chunk_size
-        end = start + chunk_size if i < n - 1 else len(text)
-        chunks.append(text[start:end])
+        chunk_size = base_size + (1 if i < remainder else 0)
+        end = start + chunk_size
+        
+        chunk = "\n".join(lines[start:end])
+        chunks.append(chunk)
+        start = end
     
+    print(f"[COORDINATOR] Text partitioned into {len(chunks)} segments from {total} lines")
     return chunks
 
-def split_files_into_chunks(files, n):
-    """
-    Read files in streaming fashion to avoid loading entire file into memory.
-    This prevents OOM (Out of Memory) errors with large datasets like enwik9.
-    """
-    print(f"[SPLIT] Streaming {len(files)} file(s) into {n} chunks...")
-    
-    # First pass: calculate total file size without loading into memory
-    total_size = 0
-    for filepath in files:
-        total_size += os.path.getsize(filepath)
-    
-    chunk_size = total_size // n
-    print(f"[SPLIT] Total size: {total_size:,} bytes")
-    print(f"[SPLIT] Target chunk size: {chunk_size:,} bytes (~{chunk_size/1024/1024:.1f} MB)")
-    
-    # Initialize chunk storage
-    chunks = [[] for _ in range(n)]
-    current_chunk_idx = 0
-    current_chunk_size = 0
-    
-    # Second pass: read in blocks and distribute
-    BLOCK_SIZE = 1024 * 1024  # 1MB blocks - prevents loading entire file
-    
-    for filepath in files:
-        print(f"  Streaming {filepath}...")
-        
-        with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
-            while True:
-                # Read small block instead of entire file
-                block = f.read(BLOCK_SIZE)
-                if not block:
-                    break
-                
-                # Add block to current chunk
-                chunks[current_chunk_idx].append(block)
-                current_chunk_size += len(block)
-                
-                # Move to next chunk when current is full
-                # (but not if we're on the last chunk)
-                if current_chunk_size >= chunk_size and current_chunk_idx < n - 1:
-                    print(f"    → Chunk {current_chunk_idx + 1} ready (~{current_chunk_size:,} bytes)")
-                    current_chunk_idx += 1
-                    current_chunk_size = 0
-    
-    # Final chunk
-    print(f"    → Chunk {n} ready (~{current_chunk_size:,} bytes)")
-    
-    # Join the blocks for each chunk
-    print(f"[SPLIT] Assembling {n} chunks...")
-    result = []
-    for i, chunk_blocks in enumerate(chunks):
-        assembled = ''.join(chunk_blocks)
-        result.append(assembled)
-        print(f"  Chunk {i+1}: {len(assembled):,} characters")
-    
-    return result
 
 def partition_dict(d, n):
-    """Partition dictionary into n roughly equal parts"""
-    items = list(d.items())
-    chunk_size = len(items) // n
+    """
+    Partition dictionary keys into n buckets using hash function.
+    """
+    partitions = [collections.defaultdict(list) for _ in range(n)]
     
-    partitions = []
-    for i in range(n):
-        start = i * chunk_size
-        end = start + chunk_size if i < n - 1 else len(items)
-        partition = dict(items[start:end])
-        partitions.append(partition)
+    for key, value in d.items():
+        index = hash(key) % n  # using hash-based partitioning to distribute keys evenly
+        partitions[index][key].extend(value)
     
     return partitions
 
-def download(url='https://mattmahoney.net/dc/enwik9.zip'):
+
+def download(url):
     """Downloads and unzips a wikipedia dataset in txt/."""
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    output_dir = os.path.join(base_dir, "txt")
+    os.makedirs(output_dir, exist_ok=True)
+    
     filename = url.split('/')[-1]
-    zip_path = filename
+    filepath = os.path.join(output_dir, filename)
+    extracted_path = filepath.replace('.zip', '')
     
-    # Download if not exists
-    if not os.path.exists(zip_path):
-        print(f"[DOWNLOAD] Downloading {url}...")
-        print(f"[DOWNLOAD] This may take several minutes for enwik9 (~300MB)...")
-        urllib.request.urlretrieve(url, zip_path)
-        print("[DOWNLOAD] Complete")
-    else:
-        print(f"[DOWNLOAD] Found {zip_path}, skipping download")
+    # Skip if already extracted
+    if os.path.exists(extracted_path):
+        print(f"[Coordinator] Dataset already exists at {extracted_path}")
+        return extracted_path
     
-    # Extract if txt/ is empty
-    os.makedirs('txt', exist_ok=True)
-    if not glob.glob('txt/*'):
-        print(f"[EXTRACT] Unzipping {zip_path}...")
-        print(f"[EXTRACT] This will create a ~1GB file...")
-        with zipfile.ZipFile(zip_path, 'r') as zf:
-            zf.extractall('txt/')
-        print("[EXTRACT] Complete")
-    else:
-        print("[EXTRACT] Dataset already extracted")
+    # Download if missing
+    if not os.path.exists(filepath):
+        print(f"[Coordinator] Downloading {url}...")
+        response = requests.get(url, stream=True)
+        response.raise_for_status()
+        with open(filepath, 'wb') as f:
+            for chunk in response.iter_content(chunk_size=8192):
+                f.write(chunk)
+        print(f"[Coordinator] Downloaded to {filepath}")
     
-    return glob.glob('txt/*')
+    # Extract if it's a zip file
+    if filepath.endswith('.zip'):
+        print(f"[Coordinator] Extracting {filepath}...")
+        with zipfile.ZipFile(filepath, 'r') as zip_ref:
+            zip_ref.extractall(output_dir)
+        print(f"[Coordinator] Extracted to {extracted_path}")
+        return extracted_path
+
+    return filepath
+
+
+def read_dataset(path):
+    """
+    Reads the dataset file returned by download() and returns its text content.
+    """
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"[Coordinator] Dataset not found at {path}")
+
+    print(f"[Coordinator] Reading dataset from {path}...")
+    with open(path, 'r', encoding='utf-8', errors='ignore') as f:
+        data = f.read()
+
+    print(f"[Coordinator] Loaded file: {path}, size: {len(data):,} characters")
+    return data
+
 
 if __name__ == "__main__":
-    # DOWNLOAD AND UNZIP DATASET (defaults to enwik9)
-    url = sys.argv[1] if len(sys.argv) > 1 else 'https://mattmahoney.net/dc/enwik9.zip'
-    
-    print("="*60)
-    print("DISTRIBUTED MAPREDUCE WORD COUNT")
-    print("="*60)
-    print(f"Workers: {len(WORKERS)}")
-    print(f"Dataset: {url}")
-    print("="*60 + "\n")
-    
-    input_files = download(url)
-    
-    # Wait for workers
-    print("\n[INIT] Waiting 5 seconds for workers to start...")
-    time.sleep(5)
-    
-    print("\n" + "="*60)
-    print("STARTING MAPREDUCE")
-    print("="*60)
+    # DOWNLOAD AND UNZIP DATASET
+    textPath = os.getenv("DATA_URL", "https://mattmahoney.net/dc/enwik9.zip")
+    textPath = download(textPath)
+    text = read_dataset(textPath)
     
     start_time = time.time()
-    word_counts = mapreduce_wordcount(input_files)
+    word_counts = mapreduce_wordcount(text)
+    
+    if word_counts:
+        print('\nTOP 20 WORDS BY FREQUENCY\n')
+        top20 = word_counts[0:20]
+        longest = max(len(word) for word, count in top20)
+        
+        i = 1
+        for word, count in top20:
+            print('%s.\t%-*s: %5s' % (i, longest+1, word, count))
+            i = i + 1
+        
     end_time = time.time()
-    
-    print('\n' + '='*60)
-    print('TOP 20 WORDS BY FREQUENCY')
-    print('='*60 + '\n')
-    
-    top20 = word_counts[0:20]
-    longest = max(len(word) for word, count in top20) if top20 else 5
-    i = 1
-    for word, count in top20:
-        print('%s.\t%-*s: %5s' % (i, longest+1, word, count))
-        i = i + 1
-    
     elapsed_time = end_time - start_time
-    print("\n" + "="*60)
-    print("Elapsed Time: {:.2f} seconds".format(elapsed_time))
-    print("="*60)
+    print("Total execution time: {} seconds".format(elapsed_time))

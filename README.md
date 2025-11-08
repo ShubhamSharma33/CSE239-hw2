@@ -1,22 +1,34 @@
 # Dockerized MapReduce Word Count
 
-A distributed MapReduce implementation using Docker containers and RPyC for word frequency analysis.
+A distributed MapReduce implementation using Docker containers and RPyC for large-scale word frequency analysis.
 
-## Architecture
+## Architecture Overview
 
-The system consists of:
-- **1 Coordinator**: Manages task distribution, handles failures, and aggregates results
-- **N Workers** (1-8): Execute Map and Reduce tasks in parallel
-- **Docker Network**: Enables container communication via hostnames
-- **RPyC**: Remote Python Calls for coordinator-worker communication
+The system implements a distributed MapReduce framework with:
+- **1 Coordinator Container**: Orchestrates task distribution, handles worker failures, and aggregates final results
+- **1-8 Worker Containers**: Execute Map and Reduce tasks in parallel
+- **Docker Networking**: Enables hostname-based communication between containers
+- **RPyC (Remote Python Calls)**: Provides RPC mechanism for coordinator-worker interaction
 
-## Requirements
+## Prerequisites
 
-- Docker & Docker Compose
+- Docker Engine (20.10+)
+- Docker Compose (v3.8+)
 - Python 3.10
-- Internet connection (for dataset download)
+- Network connection for dataset download
+- ~2GB free disk space (for enwik9 dataset)
 
-## Installation & Setup
+## Project Structure
+```
+.
+├── coordinator.py      # Coordinator logic with MapReduce orchestration
+├── worker.py          # Worker service for Map and Reduce operations
+├── docker-compose.yml # Docker orchestration for 8 workers
+├── Dockerfile        # Container image definition
+└── README.md        # This file
+```
+
+## Installation
 
 1. Clone the repository:
 ```bash
@@ -24,126 +36,144 @@ git clone <repository-url>
 cd mapreduce-docker
 ```
 
-2. Ensure all files are present:
-```
-├── Dockerfile
-├── docker-compose.yml
-├── coordinator.py
-├── worker.py
-└── README.md
-```
-
-## Running the MapReduce System
-
-### Quick Start (8 workers)
-
+2. Build Docker images:
 ```bash
-# Build and run with default 8 workers
-docker-compose up --build
-
-# Clean up after execution
-docker-compose down
+docker-compose build
 ```
 
-### Testing Different Worker Configurations
+## Running MapReduce Jobs
 
-#### 1 Worker:
-```bash
-docker-compose -f docker-compose-1worker.yml up --build
-```
-
-#### 2 Workers:
-```bash
-docker-compose -f docker-compose-2worker.yml up --build
-```
-
-#### 4 Workers:
-```bash
-docker-compose -f docker-compose-4worker.yml up --build
-```
-
-#### 8 Workers (default):
+### Default Configuration (8 Workers)
 ```bash
 docker-compose up --build
 ```
+
+### Variable Worker Configurations
+
+To run with different numbers of workers, comment out unused workers in both `coordinator.py` and `docker-compose.yml`:
+
+#### For 1 Worker:
+In `coordinator.py`, comment out workers 2-8:
+```python
+WORKERS = [
+    ("worker-1", 18865),
+    # ("worker-2", 18865),
+    # ("worker-3", 18865),
+    # ... (comment out rest)
+]
+```
+
+In `docker-compose.yml`, comment out worker services 2-8:
+```yaml
+services:
+  worker-1:
+    # ... configuration
+  # worker-2:
+  #   # ... commented out
+  # worker-3:
+  #   # ... commented out
+```
+
+Then run: `docker-compose up --build`
+
+#### For 2 Workers:
+Comment out workers 3-8 in both files and run
+
+#### For 4 Workers:
+Comment out workers 5-8 in both files and run
 
 ### Using Different Datasets
 
+Default dataset is enwik9 (~1GB). To use enwik8 (~100MB) for testing:
 ```bash
-# Default: enwik9 (~1GB)
-docker-compose up --build
-
-# For testing with smaller dataset (enwik8 ~100MB):
 docker-compose run -e DATA_URL="https://mattmahoney.net/dc/enwik8.zip" coordinator
 ```
 
 ## Implementation Details
 
+### Core Components
+
+#### Coordinator (`coordinator.py`)
+- **Variable Management**: 
+  - `worker_connections`: List of active RPyC connections to workers
+  - `num_chunks`: Number of text segments (default: workers × 8)
+  - `thread_pool_size`: Concurrent execution threads
+  - `grouped`: Shuffled intermediate key-value pairs
+- **Phases**:
+  1. **Initialization**: Downloads dataset, establishes worker connections
+  2. **Map Phase**: Distributes text chunks across workers using ThreadPoolExecutor
+  3. **Shuffle Phase**: Groups intermediate results by key
+  4. **Reduce Phase**: Partitions grouped data using hash function, sends to workers
+  5. **Aggregation**: Combines reduced results into final word counts
+
+#### Worker (`worker.py`)
+- **Map Function**: 
+  - Tokenizes text chunks
+  - Removes punctuation using `PUNCT_TRANSLATOR`
+  - Filters stop words from `STOP_WORDS` set
+  - Returns dictionary of word frequencies
+- **Reduce Function**:
+  - Receives `word_groups` (lists of counts per word)
+  - Sums all counts for each word
+  - Returns consolidated dictionary
+
 ### Key Features
 
-1. **Parallel Processing**
-   - Map phase: Chunks distributed across workers using ThreadPoolExecutor
-   - Reduce phase: Partitioned data processed in parallel
-   - Configurable chunk size: n_workers * 8 for optimal load balancing
+1. **Fault Tolerance**
+   - Automatic retry logic with round-robin worker reassignment
+   - Maximum retries equal to number of available workers
+   - 20-second timeout detection (configurable to 250s for large datasets)
+   - Failed tasks reassigned to next available worker
 
-2. **Fault Tolerance**
-   - Retry logic with maximum attempts equal to number of workers
-   - Failed tasks automatically reassigned to available workers
-   - 20-second timeout detection for unresponsive workers
+2. **Load Balancing**
+   - Text split into `num_chunks` (8× workers) for fine-grained distribution
+   - Hash-based partitioning ensures even reduce workload
+   - Parallel execution via ThreadPoolExecutor
 
 3. **Communication Protocol**
-   - RPyC with pickle serialization enabled
-   - Sync request timeout: 300 seconds
-   - Port 18865 for all workers
+   - RPyC configuration with pickle serialization enabled
+   - Sync request timeout: 250 seconds
+   - All workers listen on port 18865
+   - Hostname resolution through Docker network
 
-4. **Data Processing**
-   - Stop words filtering (common English words)
-   - Punctuation removal and case normalization
-   - Line-based text splitting to preserve word boundaries
+4. **Mutual Exclusion**
+   - Collections.Counter ensures thread-safe aggregation
+   - ThreadPoolExecutor manages concurrent worker calls
+   - No shared state between workers (stateless design)
 
-### Coordinator Workflow
+### Configuration Options
 
-1. Downloads and extracts dataset (if not present)
-2. Reads text file into memory
-3. Splits text into n_workers * 8 chunks
-4. **MAP Phase**: Distributes chunks to workers in parallel
-5. **SHUFFLE Phase**: Groups intermediate results by key
-6. **REDUCE Phase**: Partitions grouped data and sends to workers
-7. **AGGREGATION**: Combines all reduced results
-8. Outputs top 20 words by frequency
-
-### Worker Operations
-
-- **Map Function**: 
-  - Tokenizes text chunk
-  - Removes punctuation and stop words
-  - Counts word frequencies
-  - Returns dictionary of word counts
-
-- **Reduce Function**:
-  - Receives grouped word-value pairs
-  - Sums all values for each word
-  - Returns final counts dictionary
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| Worker Count | 8 | Number of worker containers (1-8) |
+| Chunks | workers×8 | Text segments for distribution |
+| Thread Pool | min(chunks, workers×8) | Concurrent execution threads |
+| Timeout | 250s | RPyC sync request timeout |
+| Worker Port | 18865 | RPyC service port |
 
 ## Performance Results
 
-| Workers | Execution Time | Speedup |
-|---------|---------------|---------|
-| 1       | ~X seconds    | 1.0x    |
-| 2       | ~X seconds    | ~X.Xx   |
-| 4       | ~X seconds    | ~X.Xx   |
-| 8       | ~X seconds    | ~X.Xx   |
+Testing with enwik8 dataset on M4 Mac:
+
+| Workers | Execution Time | Speedup | Efficiency |
+|---------|---------------|---------|------------|
+| 1 | 22.2 seconds | 1.00× | 100% |
+| 2 | 13.5 seconds | 1.65× | 82.5% |
+| 4 | 9.6 seconds | 2.31× | 57.8% |
+| 8 | 7.5 seconds | 2.95× | 36.9% |
 
 ## Monitoring & Debugging
 
-View logs from all containers:
+View real-time logs:
 ```bash
+# All containers
 docker-compose logs -f
-```
 
-View specific worker logs:
-```bash
+# Specific worker
 docker logs worker-1 -f
+
+# Coordinator only
+docker logs coordinator -f
 ```
 
 Check container status:
@@ -158,30 +188,41 @@ Remove containers and network:
 docker-compose down
 ```
 
-Remove downloaded datasets:
+Clean everything including images:
 ```bash
+docker-compose down --rmi all --volumes
 rm -rf txt/
 ```
 
-Remove all containers and images:
-```bash
-docker-compose down --rmi all --volumes
-```
+## Requirements Compliance Checklist
 
-## Requirements Checklist
+✅ **Coordinator and Worker in separate Docker containers** - Implemented via docker-compose.yml  
+✅ **Multiple workers (3+)** - Supports 1-8 workers via configuration  
+✅ **RPyC communication with hostname resolution** - Workers accessible via "worker-1" through "worker-8"  
+✅ **URL-based dataset download** - Downloads UTF-8 Wikipedia dumps via HTTP  
+✅ **Map tasks with partitioning** - Hash-based partitioning into regions  
+✅ **Reduce tasks for aggregation** - Parallel reduction of intermediate values  
+✅ **Mutual exclusion for concurrent updates** - ThreadPoolExecutor ensures safe concurrent access  
+✅ **Failed task reassignment** - Retry logic with 20s timeout (configurable)  
+✅ **Configurable worker count** - Via commenting in coordinator.py and docker-compose.yml  
+✅ **Coordinator exits after completion** - Terminates when all tasks finish  
 
-✅ Coordinator and Workers in separate Docker containers  
-✅ Multiple workers (3+) configurable via docker-compose  
-✅ RPyC communication with Docker hostname resolution  
-✅ URL-based dataset download (UTF-8)  
-✅ Map tasks with partitioning into regions  
-✅ Reduce tasks for aggregating intermediate values  
-✅ Mutual exclusion for concurrent updates  
-✅ Failed task reassignment with timeout detection  
-✅ Configurable number of workers (1-8)  
+## Troubleshooting
+
+**Workers not connecting:**
+- Ensure all worker containers are running: `docker-compose ps`
+- Check Docker network: `docker network ls`
+
+**Out of memory:**
+- Use smaller dataset (enwik8 instead of enwik9)
+- Reduce number of chunks
+
+**Slow performance:**
+- Increase timeout in RPyC config if processing large datasets
+- Ensure Docker has sufficient resources allocated
 
 ## Authors
 
-[Your Name]  
+Shubham Kumar  
 CSE 239 - Advanced Cloud Computing  
 UC Santa Cruz

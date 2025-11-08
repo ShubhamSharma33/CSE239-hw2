@@ -317,7 +317,7 @@ if __name__ == "__main__":
         protocol_config={
             "allow_public_attrs": True,
             "allow_pickle": True,
-            "sync_request_timeout": 120
+            "sync_request_timeout": 300  # Increased timeout for large data transfers
         }
     )
     
@@ -330,9 +330,12 @@ if __name__ == "__main__":
     
     print("[INIT] Coordinator RPC server started on port 18862")
     
+    # Wait a bit for server to fully initialize
+    time.sleep(2)
+    
     # Wait for workers to start and connect to coordinator
-    print("\n[INIT] Waiting 5 seconds for workers to start...")
-    time.sleep(5)
+    print("\n[INIT] Waiting 10 seconds for workers to start and connect...")
+    time.sleep(10)
     print("[INIT] Workers should now be connected to coordinator RPC server")
     
     print("\n" + "="*60)

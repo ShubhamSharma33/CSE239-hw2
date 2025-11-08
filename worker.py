@@ -41,7 +41,7 @@ def worker_main():
     print(f"[{worker_id}] Coordinator: {coordinator_host}:{coordinator_port}")
     
     # Connect to coordinator
-    max_retries = 10
+    max_retries = 20  # Increased retries
     retry_delay = 2
     coordinator_conn = None
     
@@ -54,17 +54,24 @@ def worker_main():
                 config={
                     "allow_public_attrs": True,
                     "allow_pickle": True,
-                    "sync_request_timeout": 30
+                    "sync_request_timeout": 60  # Increased timeout
                 }
             )
             print(f"[{worker_id}] Connected to coordinator!")
             break
+        except ConnectionRefusedError as e:
+            if attempt < max_retries - 1:
+                print(f"[{worker_id}] Connection refused (coordinator not ready), retrying in {retry_delay}s...")
+                time.sleep(retry_delay)
+            else:
+                print(f"[{worker_id}] Failed to connect to coordinator after {max_retries} attempts")
+                return
         except Exception as e:
             if attempt < max_retries - 1:
                 print(f"[{worker_id}] Connection failed: {e}, retrying in {retry_delay}s...")
                 time.sleep(retry_delay)
             else:
-                print(f"[{worker_id}] Failed to connect to coordinator after {max_retries} attempts")
+                print(f"[{worker_id}] Failed to connect to coordinator after {max_retries} attempts: {e}")
                 return
     
     # Worker loop: request tasks and execute them
@@ -77,6 +84,11 @@ def worker_main():
             
             if task is None:
                 # No tasks available, wait a bit
+                time.sleep(1)
+                continue
+            
+            if not isinstance(task, dict):
+                print(f"[{worker_id}] Invalid task format: {type(task)}")
                 time.sleep(1)
                 continue
             
@@ -93,29 +105,60 @@ def worker_main():
                 # Execute map function
                 result = map_function(task_data)
                 # Submit result
-                success = coordinator_conn.root.submit_map_result(task_id, result, worker_id)
-                if success:
-                    print(f"[{worker_id}] Completed MAP task {task_id}")
-                else:
-                    print(f"[{worker_id}] Failed to submit MAP task {task_id} result")
+                try:
+                    success = coordinator_conn.root.submit_map_result(task_id, result, worker_id)
+                    if success:
+                        print(f"[{worker_id}] Completed MAP task {task_id}")
+                    else:
+                        print(f"[{worker_id}] Failed to submit MAP task {task_id} result")
+                except Exception as e:
+                    print(f"[{worker_id}] Error submitting map result: {e}")
             
             elif task_type == "reduce":
                 print(f"[{worker_id}] Received REDUCE task {task_id}")
                 # Execute reduce function
                 result = reduce_function(task_data)
                 # Submit result
-                success = coordinator_conn.root.submit_reduce_result(task_id, result, worker_id)
-                if success:
-                    print(f"[{worker_id}] Completed REDUCE task {task_id}")
-                else:
-                    print(f"[{worker_id}] Failed to submit REDUCE task {task_id} result")
+                try:
+                    success = coordinator_conn.root.submit_reduce_result(task_id, result, worker_id)
+                    if success:
+                        print(f"[{worker_id}] Completed REDUCE task {task_id}")
+                    else:
+                        print(f"[{worker_id}] Failed to submit REDUCE task {task_id} result")
+                except Exception as e:
+                    print(f"[{worker_id}] Error submitting reduce result: {e}")
             
             else:
                 print(f"[{worker_id}] Unknown task type: {task_type}")
         
+        except (ConnectionError, EOFError, OSError) as e:
+            print(f"[{worker_id}] Connection error in task loop: {e}, reconnecting...")
+            # Try to reconnect
+            try:
+                coordinator_conn.close()
+            except:
+                pass
+            time.sleep(5)
+            # Reconnect
+            try:
+                coordinator_conn = rpyc.connect(
+                    coordinator_host,
+                    coordinator_port,
+                    config={
+                        "allow_public_attrs": True,
+                        "allow_pickle": True,
+                        "sync_request_timeout": 60
+                    }
+                )
+                print(f"[{worker_id}] Reconnected to coordinator")
+            except Exception as reconnect_error:
+                print(f"[{worker_id}] Failed to reconnect: {reconnect_error}")
+                time.sleep(5)
         except Exception as e:
-            print(f"[{worker_id}] Error in task loop: {e}")
-            time.sleep(1)
+            print(f"[{worker_id}] Error in task loop: {type(e).__name__}: {e}")
+            import traceback
+            traceback.print_exc()
+            time.sleep(2)
     
     coordinator_conn.close()
     print(f"[{worker_id}] Worker shutting down...")

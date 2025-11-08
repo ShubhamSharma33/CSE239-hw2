@@ -26,6 +26,7 @@ if __name__ == "__main__":
         port=18861,
         protocol_config={
             "allow_public_attrs": True,
+            "allow_pickle": True,
             "sync_request_timeout": 120
         }
     )

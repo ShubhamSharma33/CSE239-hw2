@@ -10,9 +10,9 @@ from operator import itemgetter
 # Configuration
 WORKERS = [
     ("worker-1", 18861),
-    ("worker-2", 18861),
-    ("worker-3", 18861),
-    ("worker-4", 18861),
+    # ("worker-2", 18861),
+    # ("worker-3", 18861),
+    # ("worker-4", 18861),
 ]
 
 CHUNK_SIZE = 1024 * 1024 * 50  # 50MB chunks
@@ -67,6 +67,7 @@ def mapreduce_wordcount(input_files, workers):
             port,
             config={
                 "allow_public_attrs": True,
+                "allow_pickle": True,
                 "sync_request_timeout": 120
             }
         )

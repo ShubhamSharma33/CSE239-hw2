@@ -1,5 +1,11 @@
 # Dockerized MapReduce Word Count
 
+## Authors
+
+Shubham Sharma  
+CSE 239 - Advanced Cloud Computing  
+UC Santa Cruz
+
 A distributed MapReduce implementation using Docker containers and RPyC for large-scale word frequency analysis.
 
 ## Architecture Overview
@@ -32,8 +38,8 @@ The system implements a distributed MapReduce framework with:
 
 1. Clone the repository:
 ```bash
-git clone <repository-url>
-cd mapreduce-docker
+git clone https://github.com/ShubhamSharma33/CSE239-hw2.git
+cd CSE239-hw2
 ```
 
 2. Build Docker images:
@@ -63,7 +69,7 @@ WORKERS = [
 ]
 ```
 
-In `docker-compose.yml`, comment out worker services 2-8:
+In `docker-compose.yml`, comment out worker services 2-8/remove comments from:
 ```yaml
 services:
   worker-1:
@@ -74,13 +80,27 @@ services:
   #   # ... commented out
 ```
 
+and in the same file comment out/remove comments from:
+```yaml
+depends_on:
+      - worker-1
+      # - worker-2
+      # - worker-3
+      # - worker-4
+      ...
+      ...
+```
+
 Then run: `docker-compose up --build`
 
 #### For 2 Workers:
-Comment out workers 3-8 in both files and run
+Comment out workers 3-8 in both files and run: `docker-compose down` and then `docker-compose up`
 
 #### For 4 Workers:
-Comment out workers 5-8 in both files and run
+Comment out workers 5-8 in both files and run: `docker-compose down` and then `docker-compose up`
+
+#### For 8 Workers:
+Remove all commented workers in both files and run: `docker-compose down` and then `docker-compose up`
 
 ### Using Different Datasets
 
@@ -196,16 +216,16 @@ rm -rf txt/
 
 ## Requirements Compliance Checklist
 
-✅ **Coordinator and Worker in separate Docker containers** - Implemented via docker-compose.yml  
-✅ **Multiple workers (3+)** - Supports 1-8 workers via configuration  
-✅ **RPyC communication with hostname resolution** - Workers accessible via "worker-1" through "worker-8"  
-✅ **URL-based dataset download** - Downloads UTF-8 Wikipedia dumps via HTTP  
-✅ **Map tasks with partitioning** - Hash-based partitioning into regions  
-✅ **Reduce tasks for aggregation** - Parallel reduction of intermediate values  
-✅ **Mutual exclusion for concurrent updates** - ThreadPoolExecutor ensures safe concurrent access  
-✅ **Failed task reassignment** - Retry logic with 20s timeout (configurable)  
-✅ **Configurable worker count** - Via commenting in coordinator.py and docker-compose.yml  
-✅ **Coordinator exits after completion** - Terminates when all tasks finish  
+**Coordinator and Worker in separate Docker containers** - Implemented via docker-compose.yml  
+**Multiple workers (3+)** - Supports 1-8 workers via configuration  
+**RPyC communication with hostname resolution** - Workers accessible via "worker-1" through "worker-8"  
+**URL-based dataset download** - Downloads UTF-8 Wikipedia dumps via HTTP  
+**Map tasks with partitioning** - Hash-based partitioning into regions  
+**Reduce tasks for aggregation** - Parallel reduction of intermediate values  
+**Mutual exclusion for concurrent updates** - ThreadPoolExecutor ensures safe concurrent access  
+**Failed task reassignment** - Retry logic with 20s timeout (configurable)  
+**Configurable worker count** - Via commenting in coordinator.py and docker-compose.yml  
+**Coordinator exits after completion** - Terminates when all tasks finish  
 
 ## Troubleshooting
 
@@ -221,8 +241,3 @@ rm -rf txt/
 - Increase timeout in RPyC config if processing large datasets
 - Ensure Docker has sufficient resources allocated
 
-## Authors
-
-Shubham Kumar  
-CSE 239 - Advanced Cloud Computing  
-UC Santa Cruz

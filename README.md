@@ -1,6 +1,6 @@
 # Dockerized MapReduce Word Count
 
-## Authors
+## Author
 
 Shubham Sharma  
 CSE 239 - Advanced Cloud Computing  

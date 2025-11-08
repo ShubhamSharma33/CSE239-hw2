@@ -46,27 +46,54 @@ mapreduce-docker/
 docker-compose build
 ```
 
-### 4. Run with Different Worker Configurations
+###4. Variable Worker Configurations
 
-**Run with 1 worker:**
-```bash
-docker-compose up --scale worker=1
+To run with different numbers of workers, comment out unused workers in both `coordinator.py` and `docker-compose.yml`:
+
+#### For 1 Worker:
+In `coordinator.py`, comment out workers 2-8:
+```python
+WORKERS = [
+    ("worker-1", 18865),
+    # ("worker-2", 18865),
+    # ("worker-3", 18865),
+    # ... (comment out rest)
+]
 ```
 
-**Run with 2 workers:**
-```bash
-docker-compose up --scale worker=2
+In `docker-compose.yml`, comment out worker services 2-8/remove comments from:
+```yaml
+services:
+  worker-1:
+    # ... configuration
+  # worker-2:
+  #   # ... commented out
+  # worker-3:
+  #   # ... commented out
 ```
 
-**Run with 4 workers:**
-```bash
-docker-compose up --scale worker=4
+and in the same file comment out/remove comments from:
+```yaml
+depends_on:
+      - worker-1
+      # - worker-2
+      # - worker-3
+      # - worker-4
+      ...
+      ...
 ```
 
-**Run with 8 workers:**
-```bash
-docker-compose up --scale worker=8
-```
+Then run: `docker-compose up --build`
+
+#### For 2 Workers:
+Comment out workers 3-8 in both files and run: `docker-compose down` and then `docker-compose up`
+
+#### For 4 Workers:
+Comment out workers 5-8 in both files and run: `docker-compose down` and then `docker-compose up`
+
+#### For 8 Workers:
+Remove all commented workers in both files and run: `docker-compose down` and then `docker-compose up`
+
 
 ### 5. Stop the System
 ```bash
@@ -158,54 +185,6 @@ requests==2.31.0
 docker-compose run coordinator python coordinator.py
 # Modify DATA_URL in docker-compose.yml to use enwik8.zip
 ```
-
-### Variable Worker Configurations
-
-To run with different numbers of workers, comment out unused workers in both `coordinator.py` and `docker-compose.yml`:
-
-#### For 1 Worker:
-In `coordinator.py`, comment out workers 2-8:
-```python
-WORKERS = [
-    ("worker-1", 18865),
-    # ("worker-2", 18865),
-    # ("worker-3", 18865),
-    # ... (comment out rest)
-]
-```
-
-In `docker-compose.yml`, comment out worker services 2-8/remove comments from:
-```yaml
-services:
-  worker-1:
-    # ... configuration
-  # worker-2:
-  #   # ... commented out
-  # worker-3:
-  #   # ... commented out
-```
-
-and in the same file comment out/remove comments from:
-```yaml
-depends_on:
-      - worker-1
-      # - worker-2
-      # - worker-3
-      # - worker-4
-      ...
-      ...
-```
-
-Then run: `docker-compose up --build`
-
-#### For 2 Workers:
-Comment out workers 3-8 in both files and run: `docker-compose down` and then `docker-compose up`
-
-#### For 4 Workers:
-Comment out workers 5-8 in both files and run: `docker-compose down` and then `docker-compose up`
-
-#### For 8 Workers:
-Remove all commented workers in both files and run: `docker-compose down` and then `docker-compose up`
 
 ### Using Different Datasets
 

@@ -46,7 +46,7 @@ mapreduce-docker/
 docker-compose build
 ```
 
-###4. Variable Worker Configurations
+### 4. Variable Worker Configurations
 
 To run with different numbers of workers, comment out unused workers in both `coordinator.py` and `docker-compose.yml`:
 
